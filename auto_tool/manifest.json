@@ -1,0 +1,1174 @@
+{
+  "version": "24.0.12",
+  "sourceVersion": "23.0",
+  "modules": [
+    {
+      "name": "environment",
+      "file": "src/environment.js",
+      "dependencies": [],
+      "exports": [
+        {
+          "name": "W",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "config",
+      "file": "src/config.js",
+      "dependencies": [],
+      "exports": [
+        {
+          "name": "AI",
+          "mutable": false
+        },
+        {
+          "name": "AUTOCUT",
+          "mutable": false
+        },
+        {
+          "name": "SKILL_NAMES",
+          "mutable": false
+        },
+        {
+          "name": "DIFFICULTIES",
+          "mutable": false
+        },
+        {
+          "name": "PROJECT_ID",
+          "mutable": false
+        },
+        {
+          "name": "POLL_INTERVAL",
+          "mutable": true
+        },
+        {
+          "name": "MIN_DURATION_SECONDS",
+          "mutable": true
+        },
+        {
+          "name": "GROQ",
+          "mutable": false
+        },
+        {
+          "name": "PANEL",
+          "mutable": false
+        },
+        {
+          "name": "CACHE",
+          "mutable": false
+        },
+        {
+          "name": "TOKEN_STORAGE_KEY",
+          "mutable": false
+        },
+        {
+          "name": "GROQ_API_KEY",
+          "mutable": false
+        },
+        {
+          "name": "DEFAULT_SKILL",
+          "mutable": false
+        },
+        {
+          "name": "PROMPT_RULES",
+          "mutable": false
+        },
+        {
+          "name": "CONFIG",
+          "mutable": false
+        },
+        {
+          "name": "DIFFICULTY_NAMES",
+          "mutable": false
+        },
+        {
+          "name": "FILLDESC",
+          "mutable": false
+        },
+        {
+          "name": "CLIPBOARD_KEY",
+          "mutable": false
+        },
+        {
+          "name": "CLICK_URL",
+          "mutable": false
+        },
+        {
+          "name": "PERF_LOG",
+          "mutable": false
+        },
+        {
+          "name": "RATE_LIMIT_FALLBACK_WAIT",
+          "mutable": false
+        },
+        {
+          "name": "RATE_LIMIT_SAFETY_MS",
+          "mutable": false
+        },
+        {
+          "name": "MIN_SAFE_POLL_INTERVAL",
+          "mutable": false
+        },
+        {
+          "name": "REQUEST_TIMEOUT",
+          "mutable": false
+        },
+        {
+          "name": "API_URL",
+          "mutable": false
+        },
+        {
+          "name": "STATS_API_URL",
+          "mutable": false
+        },
+        {
+          "name": "EXTRA_HOURS_API_URL",
+          "mutable": false
+        },
+        {
+          "name": "EARNINGS_RATE_VND_PER_HOUR",
+          "mutable": false
+        },
+        {
+          "name": "API_BASE",
+          "mutable": false
+        },
+        {
+          "name": "TOKEN_RETRY_INTERVAL",
+          "mutable": false
+        },
+        {
+          "name": "AUTO_ACQUIRE",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "status",
+      "file": "src/status.js",
+      "dependencies": [],
+      "exports": [
+        {
+          "name": "qcStatusTone",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "logger",
+      "file": "src/logger.js",
+      "dependencies": [
+        "status"
+      ],
+      "exports": [
+        {
+          "name": "console",
+          "mutable": false
+        },
+        {
+          "name": "_con",
+          "mutable": false
+        },
+        {
+          "name": "qcStatusLog",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "panel",
+      "file": "src/panel.js",
+      "dependencies": [
+        "config",
+        "environment"
+      ],
+      "exports": [
+        {
+          "name": "setPanelStatus",
+          "mutable": false
+        },
+        {
+          "name": "ensurePanel",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "runtime",
+      "file": "src/runtime.js",
+      "dependencies": [
+        "logger"
+      ],
+      "exports": [
+        {
+          "name": "sleep",
+          "mutable": false
+        },
+        {
+          "name": "bgSleep",
+          "mutable": false
+        },
+        {
+          "name": "waitVisible",
+          "mutable": false
+        },
+        {
+          "name": "nextPaint",
+          "mutable": false
+        },
+        {
+          "name": "bgBegin",
+          "mutable": false
+        },
+        {
+          "name": "notifyBg",
+          "mutable": false
+        },
+        {
+          "name": "bgEnd",
+          "mutable": false
+        },
+        {
+          "name": "bgClearTimeout",
+          "mutable": false
+        },
+        {
+          "name": "bgSetTimeout",
+          "mutable": false
+        },
+        {
+          "name": "bgTimer",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "storage",
+      "file": "src/storage.js",
+      "dependencies": [
+        "autoCut",
+        "config",
+        "environment",
+        "logger",
+        "media"
+      ],
+      "exports": [
+        {
+          "name": "getStoredApiKey",
+          "mutable": false
+        },
+        {
+          "name": "storageGet",
+          "mutable": false
+        },
+        {
+          "name": "storageSet",
+          "mutable": false
+        },
+        {
+          "name": "txtKey",
+          "mutable": false
+        },
+        {
+          "name": "resGet",
+          "mutable": false
+        },
+        {
+          "name": "rememberResult",
+          "mutable": false
+        },
+        {
+          "name": "imgKey",
+          "mutable": false
+        },
+        {
+          "name": "rangesGet",
+          "mutable": false
+        },
+        {
+          "name": "rangesSet",
+          "mutable": false
+        },
+        {
+          "name": "imgKeyFor",
+          "mutable": false
+        },
+        {
+          "name": "TBDB",
+          "mutable": false
+        },
+        {
+          "name": "loadCaches",
+          "mutable": false
+        },
+        {
+          "name": "savePassExample",
+          "mutable": false
+        },
+        {
+          "name": "listPassExamples",
+          "mutable": false
+        },
+        {
+          "name": "getRelevantPassExamples",
+          "mutable": false
+        },
+        {
+          "name": "clearPassExamples",
+          "mutable": false
+        }
+      ],
+      "init": true
+    },
+    {
+      "name": "gemini",
+      "file": "src/gemini.js",
+      "dependencies": [
+        "config",
+        "environment",
+        "logger",
+        "panel",
+        "runtime",
+        "storage",
+        "media",
+        "videoTransport"
+      ],
+      "exports": [
+        {
+          "name": "parseRetryMs",
+          "mutable": false
+        },
+        {
+          "name": "isDailyQuota",
+          "mutable": false
+        },
+        {
+          "name": "normalizeResult",
+          "mutable": false
+        },
+        {
+          "name": "toSlug",
+          "mutable": false
+        },
+        {
+          "name": "matchSkill",
+          "mutable": false
+        },
+        {
+          "name": "parseJsonLoose",
+          "mutable": false
+        },
+        {
+          "name": "toOpenAiSchema",
+          "mutable": false
+        },
+        {
+          "name": "geminiGenerate",
+          "mutable": false
+        },
+        {
+          "name": "gem",
+          "mutable": false
+        },
+        {
+          "name": "gemEnqueue",
+          "mutable": false
+        },
+        {
+          "name": "geminiAnalyze",
+          "mutable": false
+        },
+        {
+          "name": "GeminiQuotaError",
+          "mutable": false
+        },
+        {
+          "name": "GroqApiError",
+          "mutable": false
+        },
+        {
+          "name": "geminiAnalyzeBatch",
+          "mutable": false
+        },
+        {
+          "name": "geminiAnalyzeCases",
+          "mutable": false
+        }
+      ],
+      "init": true
+    },
+    {
+      "name": "annotationDom",
+      "file": "src/annotationDom.js",
+      "dependencies": [
+        "config",
+        "runtime"
+      ],
+      "exports": [
+        {
+          "name": "readCurrentSegmentData",
+          "mutable": false
+        },
+        {
+          "name": "getDescriptionElement",
+          "mutable": false
+        },
+        {
+          "name": "getActivityElement",
+          "mutable": false
+        },
+        {
+          "name": "getSkillGroupElement",
+          "mutable": false
+        },
+        {
+          "name": "getSceneElement",
+          "mutable": false
+        },
+        {
+          "name": "setNativeValue",
+          "mutable": false
+        },
+        {
+          "name": "setComboBoxValue",
+          "mutable": false
+        },
+        {
+          "name": "clickOptionByText",
+          "mutable": false
+        },
+        {
+          "name": "readDifficulty",
+          "mutable": false
+        },
+        {
+          "name": "getCurrentSegmentRoot",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "timeline",
+      "file": "src/timeline.js",
+      "dependencies": [
+        "autoCut",
+        "config",
+        "logger",
+        "runtime"
+      ],
+      "exports": [
+        {
+          "name": "readActiveEpisodeRange",
+          "mutable": false
+        },
+        {
+          "name": "getEpisodeRows",
+          "mutable": false
+        },
+        {
+          "name": "rowStartSec",
+          "mutable": false
+        },
+        {
+          "name": "getVideos",
+          "mutable": false
+        },
+        {
+          "name": "seekTo",
+          "mutable": false
+        },
+        {
+          "name": "waitEnabled",
+          "mutable": false
+        },
+        {
+          "name": "findNewSegmentBtn",
+          "mutable": false
+        },
+        {
+          "name": "createSegmentAt",
+          "mutable": false
+        },
+        {
+          "name": "selectSegmentAt",
+          "mutable": false
+        },
+        {
+          "name": "extendByDrag",
+          "mutable": false
+        },
+        {
+          "name": "findTimelineBlock",
+          "mutable": false
+        },
+        {
+          "name": "extendByMerge",
+          "mutable": false
+        },
+        {
+          "name": "trimTailTo",
+          "mutable": false
+        },
+        {
+          "name": "findMergeBtn",
+          "mutable": false
+        },
+        {
+          "name": "findTrimTailBtn",
+          "mutable": false
+        },
+        {
+          "name": "findUndoBtn",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "videoTransport",
+      "file": "src/videoTransport.js",
+      "dependencies": [
+        "auth",
+        "autoCut",
+        "environment",
+        "logger"
+      ],
+      "exports": [
+        {
+          "name": "getGmRequest",
+          "mutable": false
+        },
+        {
+          "name": "getVideoBlob",
+          "mutable": false
+        },
+        {
+          "name": "aiXhr",
+          "mutable": true
+        },
+        {
+          "name": "aiFetchCtrl",
+          "mutable": true
+        },
+        {
+          "name": "pickLocalVideo",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "media",
+      "file": "src/media.js",
+      "dependencies": [
+        "config",
+        "environment",
+        "handDetection",
+        "logger",
+        "runtime",
+        "timeline",
+        "videoTransport"
+      ],
+      "exports": [
+        {
+          "name": "prepareFrameSource",
+          "mutable": false
+        },
+        {
+          "name": "grabSegmentFrames",
+          "mutable": false
+        },
+        {
+          "name": "composeFrameContactSheet",
+          "mutable": false
+        },
+        {
+          "name": "isEmptyDesc",
+          "mutable": false
+        },
+        {
+          "name": "getMainVideoUrl",
+          "mutable": false
+        },
+        {
+          "name": "rowLooksEmpty",
+          "mutable": false
+        },
+        {
+          "name": "vstore",
+          "mutable": false
+        },
+        {
+          "name": "rememberVideoBlob",
+          "mutable": false
+        }
+      ],
+      "init": true
+    },
+    {
+      "name": "fill",
+      "file": "src/fill.js",
+      "dependencies": [
+        "annotationDom",
+        "config",
+        "gemini",
+        "logger",
+        "media",
+        "qcStore",
+        "runtime",
+        "storage",
+        "timeline"
+      ],
+      "exports": [
+        {
+          "name": "runAutoFill",
+          "mutable": false
+        },
+        {
+          "name": "runLoopAllEpisodes",
+          "mutable": false
+        },
+        {
+          "name": "runLoopFillL3",
+          "mutable": false
+        },
+        {
+          "name": "runCopySegment",
+          "mutable": false
+        },
+        {
+          "name": "runPasteSegment",
+          "mutable": false
+        },
+        {
+          "name": "fillFieldsFromResult",
+          "mutable": false
+        },
+        {
+          "name": "isLoopRunning",
+          "mutable": true
+        },
+        {
+          "name": "isL3LoopRunning",
+          "mutable": true
+        },
+        {
+          "name": "isFillSingleRunning",
+          "mutable": true
+        },
+        {
+          "name": "readContext",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "handDetection",
+      "file": "src/handDetection.js",
+      "dependencies": [
+        "autoCut",
+        "config",
+        "environment",
+        "logger",
+        "runtime",
+        "timeline"
+      ],
+      "exports": [
+        {
+          "name": "buildRanges",
+          "mutable": false
+        },
+        {
+          "name": "seekFrame",
+          "mutable": false
+        },
+        {
+          "name": "captureTabRanges",
+          "mutable": false
+        },
+        {
+          "name": "getHandModel",
+          "mutable": false
+        },
+        {
+          "name": "detectHandRanges",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "autoCut",
+      "file": "src/autoCut.js",
+      "dependencies": [
+        "config",
+        "environment",
+        "handDetection",
+        "logger",
+        "media",
+        "qcStore",
+        "runtime",
+        "storage",
+        "timeline",
+        "videoTransport"
+      ],
+      "exports": [
+        {
+          "name": "isAutoCutting",
+          "mutable": true
+        },
+        {
+          "name": "aiPhase",
+          "mutable": true
+        },
+        {
+          "name": "aiCache",
+          "mutable": false
+        },
+        {
+          "name": "aiAbort",
+          "mutable": true
+        },
+        {
+          "name": "aiSetBtn",
+          "mutable": false
+        },
+        {
+          "name": "runAutoCut",
+          "mutable": false
+        },
+        {
+          "name": "loadedCutTimes",
+          "mutable": true
+        },
+        {
+          "name": "loadedJsonName",
+          "mutable": true
+        },
+        {
+          "name": "runAutoCutFromTimes",
+          "mutable": false
+        },
+        {
+          "name": "hasPendingCutPreview",
+          "mutable": false
+        },
+        {
+          "name": "cancelCutPreview",
+          "mutable": false
+        },
+        {
+          "name": "updateAutoCutBtnState",
+          "mutable": false
+        }
+      ],
+      "init": true
+    },
+    {
+      "name": "auth",
+      "file": "src/auth.js",
+      "dependencies": [
+        "environment"
+      ],
+      "exports": [
+        {
+          "name": "findToken",
+          "mutable": false
+        },
+        {
+          "name": "origFetch",
+          "mutable": false
+        },
+        {
+          "name": "rejectedTokens",
+          "mutable": false
+        },
+        {
+          "name": "cachedTokenCandidate",
+          "mutable": true
+        }
+      ],
+      "init": true
+    },
+    {
+      "name": "notifications",
+      "file": "src/notifications.js",
+      "dependencies": [
+        "config",
+        "taskMonitor"
+      ],
+      "exports": [
+        {
+          "name": "ensurePermission",
+          "mutable": false
+        },
+        {
+          "name": "showAcquireNotification",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "taskMonitor",
+      "file": "src/taskMonitor.js",
+      "dependencies": [
+        "auth",
+        "config",
+        "environment",
+        "logger",
+        "notifications",
+        "runtime"
+      ],
+      "exports": [
+        {
+          "name": "getAdaptivePollInterval",
+          "mutable": false
+        },
+        {
+          "name": "stop",
+          "mutable": false
+        },
+        {
+          "name": "tick",
+          "mutable": false
+        },
+        {
+          "name": "log",
+          "mutable": false
+        },
+        {
+          "name": "stopped",
+          "mutable": true
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "controls",
+      "file": "src/controls.js",
+      "dependencies": [
+        "config",
+        "fill",
+        "logger",
+        "panel",
+        "taskMonitor",
+        "timeline"
+      ],
+      "exports": [
+        {
+          "name": "injectUIControls",
+          "mutable": false
+        }
+      ],
+      "init": true
+    },
+    {
+      "name": "earnings",
+      "file": "src/earnings.js",
+      "dependencies": [
+        "auth",
+        "config",
+        "environment",
+        "logger",
+        "runtime"
+      ],
+      "exports": [
+        {
+          "name": "updateMyEarnings",
+          "mutable": false
+        },
+        {
+          "name": "calculateTaskEarningsFromTimeline",
+          "mutable": false
+        },
+        {
+          "name": "updateTaskEarnings",
+          "mutable": false
+        },
+        {
+          "name": "formatDuration",
+          "mutable": false
+        },
+        {
+          "name": "localDateKey",
+          "mutable": false
+        },
+        {
+          "name": "localMonthKey",
+          "mutable": false
+        },
+        {
+          "name": "readTodayExtraSeconds",
+          "mutable": false
+        },
+        {
+          "name": "readMonthExtraSeconds",
+          "mutable": false
+        },
+        {
+          "name": "readSubmissionSecondsByPeriod",
+          "mutable": false
+        },
+        {
+          "name": "renderMyReportWorkingHours",
+          "mutable": false
+        },
+        {
+          "name": "ensureMyReportWorkingHoursCard",
+          "mutable": false
+        },
+        {
+          "name": "start",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "r2Scanner",
+      "file": "src/r2Scanner.js",
+      "dependencies": [],
+      "exports": [
+        {
+          "name": "R2_SCAN_SRC",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "r2Bridge",
+      "file": "src/r2Bridge.js",
+      "dependencies": [
+        "autoCut",
+        "config",
+        "logger",
+        "panel",
+        "qcStore",
+        "r2Scanner",
+        "timeline"
+      ],
+      "exports": [
+        {
+          "name": "parseR2Result",
+          "mutable": false
+        },
+        {
+          "name": "injectR2Btns",
+          "mutable": false
+        }
+      ],
+      "init": true
+    },
+    {
+      "name": "qcStore",
+      "file": "src/qcStore.js",
+      "dependencies": [],
+      "exports": [
+        {
+          "name": "state",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "qcDomain",
+      "file": "src/qcDomain.js",
+      "dependencies": [
+        "config"
+      ],
+      "exports": [
+        {
+          "name": "extractFeedback",
+          "mutable": false
+        },
+        {
+          "name": "extractEpisodes",
+          "mutable": false
+        },
+        {
+          "name": "validateMappings",
+          "mutable": false
+        },
+        {
+          "name": "getAllowedFields",
+          "mutable": false
+        },
+        {
+          "name": "requiresTimelineReview",
+          "mutable": false
+        },
+        {
+          "name": "isValidFieldValue",
+          "mutable": false
+        },
+        {
+          "name": "normalizeFieldValue",
+          "mutable": false
+        },
+        {
+          "name": "createFeedbackSignature",
+          "mutable": false
+        },
+        {
+          "name": "getTaskIdFromPage",
+          "mutable": false
+        },
+        {
+          "name": "MAPPING_SCHEMA",
+          "mutable": false
+        },
+        {
+          "name": "QC_FIELDS",
+          "mutable": false
+        },
+        {
+          "name": "FIELD_UI_KEYS",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "qcApi",
+      "file": "src/qcApi.js",
+      "dependencies": [
+        "auth",
+        "config",
+        "environment"
+      ],
+      "exports": [
+        {
+          "name": "getJson",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "qcController",
+      "file": "src/qcController.js",
+      "dependencies": [
+        "annotationDom",
+        "autoCut",
+        "config",
+        "environment",
+        "fill",
+        "gemini",
+        "logger",
+        "media",
+        "panel",
+        "qcApi",
+        "qcDomain",
+        "qcStore",
+        "qcView",
+        "runtime",
+        "storage",
+        "timeline"
+      ],
+      "exports": [
+        {
+          "name": "labelsMatch",
+          "mutable": false
+        },
+        {
+          "name": "refreshEligibility",
+          "mutable": false
+        },
+        {
+          "name": "onCheckClick",
+          "mutable": false
+        },
+        {
+          "name": "onFixClick",
+          "mutable": false
+        },
+        {
+          "name": "onUndoClick",
+          "mutable": false
+        },
+        {
+          "name": "savePassExampleFromCurrentTask",
+          "mutable": false
+        },
+        {
+          "name": "listPassExamples",
+          "mutable": false
+        },
+        {
+          "name": "clearPassExamples",
+          "mutable": false
+        }
+      ],
+      "init": true
+    },
+    {
+      "name": "qcView",
+      "file": "src/qcView.js",
+      "dependencies": [
+        "logger",
+        "panel",
+        "qcController",
+        "qcDomain",
+        "qcStore",
+        "status"
+      ],
+      "exports": [
+        {
+          "name": "render",
+          "mutable": false
+        },
+        {
+          "name": "mount",
+          "mutable": false
+        }
+      ],
+      "init": false
+    },
+    {
+      "name": "qcLifecycle",
+      "file": "src/qcLifecycle.js",
+      "dependencies": [
+        "environment",
+        "qcStore"
+      ],
+      "exports": [],
+      "init": true
+    },
+    {
+      "name": "bootstrap",
+      "file": "src/bootstrap.js",
+      "dependencies": [
+        "panel",
+        "controls",
+        "autoCut",
+        "r2Bridge",
+        "qcView",
+        "storage",
+        "taskMonitor",
+        "earnings",
+        "notifications",
+        "logger",
+        "runtime"
+      ],
+      "exports": [
+        {
+          "name": "start",
+          "mutable": false
+        }
+      ],
+      "init": false
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "verifiedBusinessStatements": 293,
+  "validatedCrossModuleReferences": 693,
+  "regressionCases": 67,
+  "r2ScannerSha256": "f59b69a3038b6656892a4b59e841e70d2ebeb245dc5f8721d334075631a53e1a",
+  "sourceSha256": "7422d15274c22774206b6a849cdf33b8406e0444539911224bc44f5d2e4238ef",
+  "browserEndToEndTested": false,
+  "moduleCount": 28,
+  "offlineTestsPassed": 77,
+  "offlineTestsFailed": 0,
+  "testEnvironment": "Node.js VM browser doubles; no real network or live browser session",
+  "intentionalStartupChanges": [
+    "Register hooks after every module is constructed",
+    "Mount controls before starting polling to restore saved settings",
+    "Honor the existing tbAutoActive=false setting at startup",
+    "Make hook initialization and bootstrap startup idempotent",
+    "Use named refresh jobs with the original refresh intervals"
+  ]
+}

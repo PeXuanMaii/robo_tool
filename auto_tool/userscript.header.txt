@@ -1,0 +1,16 @@
+// ==UserScript==
+// @name         tbrain_tool_for_labeler
+// @namespace    tbrain-master
+// @version      24.0.12
+// @description  Groq AI auto-fill + Auto-fetch + R2 suggestions + QC feedback-to-field mapping
+// @match        https://*.tbrain.ai/*
+// @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @grant        GM_notification
+// @grant        GM.notification
+// @grant        unsafeWindow
+// @connect      api.groq.com
+// @connect      *
+// @require      https://cdn.jsdelivr.net/npm/handtrackjs@latest/dist/handtrack.min.js
+// ==/UserScript==
