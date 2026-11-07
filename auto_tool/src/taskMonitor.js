@@ -69,7 +69,7 @@ module.exports = function createTaskMonitor(modules) {
     function hasExcludedL1(task, excludedL1) {
         if (!task || typeof task !== "object")
             return false;
-        return [task.L1, task.l1].some(value => typeof value === "string"
+        return [task.envL1, task.envl1].some(value => typeof value === "string"
             && excludedL1.has(value.trim().toLowerCase()));
     }
     async function fetchPool(token) {
