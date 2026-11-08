@@ -674,7 +674,7 @@ module.exports = function createEarnings(modules) {
                 labelledSeconds: 0,
                 extraSeconds: 0,
                 lastLabelledSeconds: statsSeconds,
-                lastExtraSeconds: extraSeconds,
+                lastExtraSeconds: 0,
                 trackingStartedAt: Date.now()
             };
         }
@@ -682,9 +682,9 @@ module.exports = function createEarnings(modules) {
             dailyTracking = {
                 ...previous,
                 labelledSeconds: previous.labelledSeconds + Math.max(0, statsSeconds - previous.lastLabelledSeconds),
-                extraSeconds: previous.extraSeconds + Math.max(0, extraSeconds - previous.lastExtraSeconds),
+                extraSeconds: 0,
                 lastLabelledSeconds: statsSeconds,
-                lastExtraSeconds: extraSeconds
+                lastExtraSeconds: 0
             };
         }
         saveDailyTracking();
@@ -738,7 +738,7 @@ module.exports = function createEarnings(modules) {
                     throw new Error(`extra-hours[${index}] không hợp lệ`);
                 return total + readNonNegativeSeconds(item.seconds, `extra-hours[${index}].seconds`);
             }, 0);
-            totalSeconds = statsSeconds + extraSeconds;
+            totalSeconds = statsSeconds;
             lastUpdateError = '';
             const periodReadAt = new Date();
             const today = localDateKey(periodReadAt);
@@ -785,7 +785,7 @@ module.exports = function createEarnings(modules) {
             }
             todayTrackingStartedAt = localTracking.trackingStartedAt;
             if (submissionPeriodSeconds !== null) {
-                todaySeconds = submissionPeriodSeconds.todaySeconds + (extraTodaySeconds === null ? 0 : extraTodaySeconds);
+                todaySeconds = submissionPeriodSeconds.todaySeconds;
                 todayIsEstimated = false;
                 todayDataError = extraTodaySeconds === null
                     ? `extra-hours không có ngày để lọc; khoản này chưa được cộng vào tổng ngày${extraReadError ? ` (${extraReadError})` : ''}`
@@ -813,7 +813,7 @@ module.exports = function createEarnings(modules) {
                 lastExtraDateWarning = reportDataWarning;
             }
             else {
-                todaySeconds = localTracking.labelledSeconds + localTracking.extraSeconds;
+                todaySeconds = localTracking.labelledSeconds;
                 todayIsEstimated = true;
                 todayDataError = `Không đọc được submissions; dùng bộ đếm cục bộ: ${submissionsReadError}`;
                 if (todayDataError !== lastTodayDataWarning)
