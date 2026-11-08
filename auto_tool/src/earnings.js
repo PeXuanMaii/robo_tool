@@ -389,6 +389,17 @@ module.exports = function createEarnings(modules) {
         return seconds;
     }
 
+    function readStatsSeconds(statsData) {
+        if (!statsData || typeof statsData !== 'object' || Array.isArray(statsData))
+            throw new Error('Dữ liệu my-stats không đúng định dạng');
+        const rawValue = typeof statsData.approvedSeconds !== 'undefined'
+            ? statsData.approvedSeconds
+            : typeof statsData.labelledSeconds !== 'undefined'
+                ? statsData.labelledSeconds
+                : 0;
+        return readNonNegativeSeconds(rawValue, 'approvedSeconds/labelledSeconds');
+    }
+
     function normalizeDateKey(value) {
         if (typeof value === 'number' && Number.isFinite(value)) {
             const timestamp = Math.abs(value) < 1e12 ? value * 1000 : value;
@@ -674,7 +685,7 @@ module.exports = function createEarnings(modules) {
                 labelledSeconds: 0,
                 extraSeconds: 0,
                 lastLabelledSeconds: statsSeconds,
-                lastExtraSeconds: 0,
+                lastExtraSeconds: extraSeconds,
                 trackingStartedAt: Date.now()
             };
         }
@@ -682,9 +693,9 @@ module.exports = function createEarnings(modules) {
             dailyTracking = {
                 ...previous,
                 labelledSeconds: previous.labelledSeconds + Math.max(0, statsSeconds - previous.lastLabelledSeconds),
-                extraSeconds: 0,
+                extraSeconds: previous.extraSeconds + Math.max(0, extraSeconds - previous.lastExtraSeconds),
                 lastLabelledSeconds: statsSeconds,
-                lastExtraSeconds: 0
+                lastExtraSeconds: extraSeconds
             };
         }
         saveDailyTracking();
@@ -732,13 +743,13 @@ module.exports = function createEarnings(modules) {
                 throw new Error('Dữ liệu my-stats không đúng định dạng');
             if (!Array.isArray(extraData))
                 throw new Error('Dữ liệu extra-hours không đúng định dạng');
-            const statsSeconds = readNonNegativeSeconds(statsData.labelledSeconds, 'labelledSeconds');
+            const statsSeconds = readStatsSeconds(statsData);
             const extraSeconds = extraData.reduce((total, item, index) => {
                 if (!item || typeof item !== 'object' || Array.isArray(item))
                     throw new Error(`extra-hours[${index}] không hợp lệ`);
                 return total + readNonNegativeSeconds(item.seconds, `extra-hours[${index}].seconds`);
             }, 0);
-            totalSeconds = statsSeconds;
+            totalSeconds = statsSeconds + extraSeconds;
             lastUpdateError = '';
             const periodReadAt = new Date();
             const today = localDateKey(periodReadAt);
@@ -785,7 +796,7 @@ module.exports = function createEarnings(modules) {
             }
             todayTrackingStartedAt = localTracking.trackingStartedAt;
             if (submissionPeriodSeconds !== null) {
-                todaySeconds = submissionPeriodSeconds.todaySeconds;
+                todaySeconds = submissionPeriodSeconds.todaySeconds + (extraTodaySeconds === null ? 0 : extraTodaySeconds);
                 todayIsEstimated = false;
                 todayDataError = extraTodaySeconds === null
                     ? `extra-hours không có ngày để lọc; khoản này chưa được cộng vào tổng ngày${extraReadError ? ` (${extraReadError})` : ''}`
@@ -813,7 +824,7 @@ module.exports = function createEarnings(modules) {
                 lastExtraDateWarning = reportDataWarning;
             }
             else {
-                todaySeconds = localTracking.labelledSeconds;
+                todaySeconds = localTracking.labelledSeconds + localTracking.extraSeconds;
                 todayIsEstimated = true;
                 todayDataError = `Không đọc được submissions; dùng bộ đếm cục bộ: ${submissionsReadError}`;
                 if (todayDataError !== lastTodayDataWarning)
