@@ -6209,7 +6209,7 @@ factories.earnings = function createEarnings(modules) {
             const stored = JSON.parse(raw);
             const validDate = stored && typeof stored.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(stored.date);
             const validCounters = stored
-                && ['labelledSeconds', 'extraSeconds', 'lastLabelledSeconds', 'lastExtraSeconds', 'trackingStartedAt']
+                && ['approvedSeconds', 'extraSeconds', 'lastapprovedSeconds', 'lastExtraSeconds', 'trackingStartedAt']
                     .every(field => typeof stored[field] === 'number' && Number.isFinite(stored[field]) && stored[field] >= 0);
             if (!validDate || !validCounters)
                 throw new Error('Dữ liệu bộ đếm ngày không hợp lệ');
@@ -6235,9 +6235,9 @@ factories.earnings = function createEarnings(modules) {
         if (!previous || previous.date !== today) {
             dailyTracking = {
                 date: today,
-                labelledSeconds: 0,
+                approvedSeconds: 0,
                 extraSeconds: 0,
-                lastLabelledSeconds: statsSeconds,
+                lastapprovedSeconds: statsSeconds,
                 lastExtraSeconds: extraSeconds,
                 trackingStartedAt: Date.now()
             };
@@ -6245,9 +6245,9 @@ factories.earnings = function createEarnings(modules) {
         else {
             dailyTracking = {
                 ...previous,
-                labelledSeconds: previous.labelledSeconds + Math.max(0, statsSeconds - previous.lastLabelledSeconds),
+                approvedSeconds: previous.approvedSeconds + Math.max(0, statsSeconds - previous.lastapprovedSeconds),
                 extraSeconds: previous.extraSeconds + Math.max(0, extraSeconds - previous.lastExtraSeconds),
-                lastLabelledSeconds: statsSeconds,
+                lastapprovedSeconds: statsSeconds,
                 lastExtraSeconds: extraSeconds
             };
         }
@@ -6296,7 +6296,7 @@ factories.earnings = function createEarnings(modules) {
                 throw new Error('Dữ liệu my-stats không đúng định dạng');
             if (!Array.isArray(extraData))
                 throw new Error('Dữ liệu extra-hours không đúng định dạng');
-            const statsSeconds = readNonNegativeSeconds(statsData.labelledSeconds, 'labelledSeconds');
+            const statsSeconds = readNonNegativeSeconds(statsData.approvedSeconds, 'approvedSeconds');
             const extraSeconds = extraData.reduce((total, item, index) => {
                 if (!item || typeof item !== 'object' || Array.isArray(item))
                     throw new Error(`extra-hours[${index}] không hợp lệ`);
@@ -6377,7 +6377,7 @@ factories.earnings = function createEarnings(modules) {
                 lastExtraDateWarning = reportDataWarning;
             }
             else {
-                todaySeconds = localTracking.labelledSeconds + localTracking.extraSeconds;
+                todaySeconds = localTracking.approvedSeconds + localTracking.extraSeconds;
                 todayIsEstimated = true;
                 todayDataError = `Không đọc được submissions; dùng bộ đếm cục bộ: ${submissionsReadError}`;
                 if (todayDataError !== lastTodayDataWarning)
