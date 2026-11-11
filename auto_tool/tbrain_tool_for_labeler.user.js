@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tbrain_tool_for_labeler
 // @namespace    tbrain-master
-// @version      24.0.13
+// @version      24.0.14
 // @description  Groq AI auto-fill + Auto-fetch + email alerts + R2 suggestions + QC feedback-to-field mapping
 // @match        https://*.tbrain.ai/*
 // @run-at       document-start
@@ -5123,6 +5123,9 @@ factories.controls = function createControls(modules) {
 #tb-fetch-settings-wrapper .tbp-fetch-settings-field{display:flex;flex-direction:column;gap:5px;min-width:0;color:#cbd5e1;font-size:11px;font-weight:600}
 #tb-fetch-settings-wrapper .tbp-fetch-settings-field .tbp-control-input{width:100%;min-width:0;max-width:none;height:34px}
 #tb-fetch-settings-wrapper .tbp-fetch-settings-hint{margin-top:-5px;color:#94a3b8;font-size:10px;font-weight:400}
+#tb-fetch-settings-wrapper .tbp-fetch-email-config-row{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:8px;min-width:0}
+#tb-fetch-settings-wrapper .tbp-fetch-email-compact-field{min-width:0}
+#tb-fetch-settings-wrapper .tbp-fetch-email-compact-field .tbp-control-input{font-size:10px;padding-left:7px;padding-right:7px}
 #tb-api-key-modal.tbp-modal{display:none;position:absolute;top:38px;right:0;box-sizing:border-box;width:260px;max-width:calc(100vw - 24px);padding:12px;border:1px solid #475569;border-radius:9px;background:#111827;color:#e2e8f0;z-index:9999;box-shadow:0 10px 24px rgba(0,0,0,.32)}
 #tb-api-key-modal .tbp-modal-title{margin-bottom:8px;color:#f8fafc;font-size:11px;font-weight:600}
 #tb-api-key-modal .tbp-modal-input{width:100%;margin-bottom:8px}
@@ -5559,9 +5562,27 @@ factories.controls = function createControls(modules) {
         appendField('Poll interval (ms)', pollInput);
         appendField('Thời lượng tối thiểu (giây)', durationInput);
         appendField('L1 Except', l1ExceptInput);
+
+        // Email configuration stays inside the single Fetch Task settings panel.
+        // Two rows: recipient address, then Web App URL + per-user secret side by side.
         appendField('Email nhận thông báo', emailInput);
-        appendField('Google Apps Script Web App URL', emailEndpointInput);
-        appendField('Webhook Secret', emailSecretInput);
+        const emailServiceRow = document.createElement('div');
+        emailServiceRow.className = 'tbp-fetch-email-config-row';
+        const appendCompactEmailField = (labelText, input) => {
+            const field = document.createElement('label');
+            field.className = 'tbp-fetch-settings-field tbp-fetch-email-compact-field';
+            field.setAttribute('for', input.id);
+            const label = document.createElement('span');
+            label.className = 'tbp-fetch-setting-label';
+            label.textContent = labelText;
+            field.appendChild(label);
+            field.appendChild(input);
+            emailServiceRow.appendChild(field);
+        };
+        appendCompactEmailField('Apps Script URL', emailEndpointInput);
+        appendCompactEmailField('Webhook Secret', emailSecretInput);
+        wrapper.appendChild(emailServiceRow);
+
         const hint = document.createElement('div');
         hint.className = 'tbp-fetch-settings-hint';
         hint.textContent = 'Email dùng chung công tắc Fetch Task. Nhập email, Web App URL và Webhook Secret của chính bạn; để trống một trong các trường thì không gửi email. Các cấu hình được lưu riêng trong trình duyệt, không nằm trong mã nguồn Git.';
