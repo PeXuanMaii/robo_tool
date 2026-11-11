@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         tbrain_tool_for_labeler
 // @namespace    tbrain-master
-// @version      24.0.12
-// @description  Groq AI auto-fill + Auto-fetch + R2 suggestions + QC feedback-to-field mapping
+// @version      24.0.13
+// @description  Groq AI auto-fill + Auto-fetch + email alerts + R2 suggestions + QC feedback-to-field mapping
 // @match        https://*.tbrain.ai/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -68,6 +68,13 @@ factories.config = function createConfig(modules) {
     const NOTIFY_ON_FIRST_POLL = true;
     const MAX_SEEN_IDS = 5000;
     const AUTO_ACQUIRE = true;
+    // Email delivery via Google Apps Script Web App. Paste the deployed URL here.
+    // Per-user email integration settings are stored locally in the browser, never committed to Git.
+    const EMAIL_WEB_APP_URL = '';
+    const EMAIL_WEBHOOK_TOKEN = '';
+    const EMAIL_WEB_APP_URL_STORAGE_KEY = 'tb_email_web_app_url';
+    const EMAIL_WEBHOOK_TOKEN_STORAGE_KEY = 'tb_email_webhook_token';
+    const EMAIL_POLL_INTERVAL = 15000;
     const PERF_LOG = true;
     const RATE_LIMIT_RESERVE = 30;
     const MIN_SAFE_POLL_INTERVAL = 2500;
@@ -276,7 +283,12 @@ factories.config = function createConfig(modules) {
         get EXTRA_HOURS_API_URL() { return EXTRA_HOURS_API_URL; },
         get EARNINGS_RATE_VND_PER_HOUR() { return EARNINGS_RATE_VND_PER_HOUR; },
         get TOKEN_RETRY_INTERVAL() { return TOKEN_RETRY_INTERVAL; },
-        get AUTO_ACQUIRE() { return AUTO_ACQUIRE; }
+        get AUTO_ACQUIRE() { return AUTO_ACQUIRE; },
+        get EMAIL_WEB_APP_URL() { return (localStorage.getItem(EMAIL_WEB_APP_URL_STORAGE_KEY) || EMAIL_WEB_APP_URL).trim(); },
+        get EMAIL_WEBHOOK_TOKEN() { return (localStorage.getItem(EMAIL_WEBHOOK_TOKEN_STORAGE_KEY) || EMAIL_WEBHOOK_TOKEN).trim(); },
+        get EMAIL_WEB_APP_URL_STORAGE_KEY() { return EMAIL_WEB_APP_URL_STORAGE_KEY; },
+        get EMAIL_WEBHOOK_TOKEN_STORAGE_KEY() { return EMAIL_WEBHOOK_TOKEN_STORAGE_KEY; },
+        get EMAIL_POLL_INTERVAL() { return EMAIL_POLL_INTERVAL; }
     };
 };
 
@@ -4666,12 +4678,75 @@ factories.notifications = function createNotifications(modules) {
         }
     }
 
+    function sendEmail(item, eventType) {
+        // Email shares the existing Fetch Task master switch. No separate email toggle.
+        const recipient = String(localStorage.getItem('tb_email_recipient') || '').trim();
+        const endpoint = String(modules.config.EMAIL_WEB_APP_URL || '').trim();
+        const webhookToken = String(modules.config.EMAIL_WEBHOOK_TOKEN || '').trim();
+        if (modules.taskMonitor.stopped || !recipient || !endpoint || !webhookToken)
+            return Promise.resolve(false);
+        const title = eventType === 'rework' ? 'Task bị QC trả về (Rework)' : 'Phát hiện task mới trong Task Pool';
+        const details = [
+            `Sự kiện: ${title}`,
+            `Task ID: ${item.id || 'N/A'}`,
+            item.status ? `Trạng thái: ${item.status}` : '',
+            Number.isFinite(Number(item.durationSeconds)) ? `Thời lượng: ${(Number(item.durationSeconds) / 3600).toFixed(2)} giờ` : '',
+            `Thời gian: ${new Date().toLocaleString()}`
+        ].filter(Boolean).join('\n');
+        const payload = JSON.stringify({ token: webhookToken, to: recipient, subject: `[TBrain] ${title} - ${item.id || ''}`, body: details });
+        const gmRequest = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest
+            : (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function' ? GM.xmlHttpRequest.bind(GM) : null);
+        if (!gmRequest)
+            return Promise.resolve(false);
+        return new Promise(resolve => {
+            try {
+                gmRequest({
+                    method: 'POST', url: endpoint, data: payload,
+                    headers: { 'Content-Type': 'application/json' },
+                    timeout: 15000,
+                    onload: response => resolve(response.status >= 200 && response.status < 300),
+                    onerror: () => resolve(false),
+                    ontimeout: () => resolve(false)
+                });
+            }
+            catch (_) { resolve(false); }
+        });
+    }
+
+    async function showReworkNotification(item) {
+        const content = {
+            title: '↩️ Task bị QC trả về (Rework)',
+            body: `ID: ${item.id}\nTrạng thái: ${item.status || 'Rework'}`,
+            tag: `tbrain-rework-${item.id}`
+        };
+        const managerNotify = getUserscriptNotification();
+        if (managerNotify) {
+            try {
+                await managerNotify({ title: content.title, text: content.body, tag: content.tag, timeout: 10000, onclick: () => openTask() });
+            } catch (error) { modules.taskMonitor.log.warn('Rework notification failed:', error); }
+        } else if (await ensurePermission()) {
+            try {
+                const notification = new Notification(content.title, {
+                    body: content.body, tag: content.tag, renotify: true,
+                    data: { url: modules.config.CLICK_URL }
+                });
+                notification.onclick = event => {
+                    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+                    openTask(notification);
+                };
+            } catch (error) { modules.taskMonitor.log.warn('Rework browser notification failed:', error); }
+        }
+        void sendEmail(item, 'rework');
+    }
+
     return {
         get ensurePermission() { return ensurePermission; },
         get enableNotifications() { return enableNotifications; },
         get getPermissionState() { return getPermissionState; },
         get activateAudio() { return unlockAudio; },
-        get showAcquireNotification() { return showAcquireNotification; }
+        get showAcquireNotification() { return showAcquireNotification; },
+        get sendEmail() { return sendEmail; },
+        get showReworkNotification() { return showReworkNotification; }
     };
 };
 
@@ -4822,6 +4897,17 @@ factories.taskMonitor = function createTaskMonitor(modules) {
         let candidate = modules.auth.findToken() || modules.auth.findToken(true);
         if (!candidate)
             return modules.config.TOKEN_RETRY_INTERVAL;
+        if (!reworkScanTimer) {
+            void scanMyTasksForRework(candidate.token);
+            reworkScanTimer = modules.runtime.bgSetTimeout(function reworkLoop() {
+                reworkScanTimer = null;
+                if (!stopped) {
+                    const currentToken = modules.auth.findToken() || modules.auth.findToken(true);
+                    if (currentToken) void scanMyTasksForRework(currentToken.token);
+                    reworkScanTimer = modules.runtime.bgSetTimeout(reworkLoop, modules.config.EMAIL_POLL_INTERVAL);
+                }
+            }, modules.config.EMAIL_POLL_INTERVAL);
+        }
         let response;
         try {
             response = await fetchPool(candidate.token);
@@ -4861,12 +4947,73 @@ factories.taskMonitor = function createTaskMonitor(modules) {
             }
         }
         if (eligibleTasks.length > 0) {
+            for (const task of eligibleTasks) {
+                void modules.notifications.sendEmail({ id: getTaskId(task), durationSeconds: Number(task.durationSeconds) }, 'pool');
+            }
             if (modules.config.AUTO_ACQUIRE) {
                 await acquireNew(candidate.token, eligibleTasks);
             }
         }
         return getAdaptivePollInterval();
     }
+    const reworkSeen = new Map();
+    let reworkBaselineReady = false;
+    let reworkScanRunning = false;
+    let reworkScanTimer = null;
+    const REWORK_STATUSES = new Set(['rework', 'rework_needed', 'rework needed', 'rework_requested', 'rework requested', 'rework_required', 'rework required', 'needs_rework', 'needs rework']);
+    async function scanMyTasksForRework(token) {
+        if (reworkScanRunning) return;
+        reworkScanRunning = true;
+        try {
+            const pageSize = 100;
+            const urlFor = page => `${modules.config.API_BASE}/api/v1/tasks?page=${page}&pageSize=${pageSize}&projectId=${encodeURIComponent(modules.config.PROJECT_ID)}`;
+            const firstResponse = await modules.auth.origFetch.call(modules.environment.W, urlFor(1), {
+                method: 'GET', headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+                credentials: 'include', cache: 'no-store'
+            });
+            if (!firstResponse.ok) return;
+            const first = await firstResponse.json();
+            if (!first || !Array.isArray(first.data) || !first.pagination) return;
+            const total = Number(first.pagination.total);
+            if (!Number.isFinite(total) || total < 0) return;
+            const tasks = first.data.slice();
+            const pages = Math.max(1, Math.ceil(total / pageSize));
+            // Task list pagination is bounded to avoid monopolizing the API.
+            for (let page = 2; page <= Math.min(pages, 20); page++) {
+                const response = await modules.auth.origFetch.call(modules.environment.W, urlFor(page), {
+                    method: 'GET', headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+                    credentials: 'include', cache: 'no-store'
+                });
+                if (!response.ok) break;
+                const payload = await response.json();
+                if (!payload || !Array.isArray(payload.data)) break;
+                tasks.push(...payload.data);
+            }
+            const current = new Map();
+            for (const task of tasks) {
+                const id = getTaskId(task);
+                if (id === null || typeof task.status !== 'string') continue;
+                const status = task.status.trim().toLowerCase().replace(/[-_]+/g, ' ');
+                const isRework = REWORK_STATUSES.has(status) || status.includes('rework');
+                current.set(id, { id, status: task.status, isRework });
+            }
+            if (!reworkBaselineReady) {
+                for (const [id, item] of current) reworkSeen.set(id, item.isRework);
+                reworkBaselineReady = true;
+                return;
+            }
+            for (const [id, item] of current) {
+                const wasRework = reworkSeen.get(id) === true;
+                if (item.isRework && !wasRework)
+                    void modules.notifications.showReworkNotification(item);
+                reworkSeen.set(id, item.isRework);
+            }
+            for (const id of reworkSeen.keys()) if (!current.has(id)) reworkSeen.delete(id);
+        } catch (error) {
+            log.warn('My Tasks rework scan failed:', error && error.message ? error.message : error);
+        } finally { reworkScanRunning = false; }
+    }
+
     let fetchHold = false; // Web Lock là best-effort; trình duyệt/Android vẫn có thể tạm dừng tab.
     async function tick() {
         if (stopped || cycleRunning)
@@ -4892,7 +5039,9 @@ factories.taskMonitor = function createTaskMonitor(modules) {
     function stop() {
         stopped = true;
         modules.runtime.bgClearTimeout(timer);
+        modules.runtime.bgClearTimeout(reworkScanTimer);
         timer = null;
+        reworkScanTimer = null;
         if (fetchHold) {
             fetchHold = false;
             modules.runtime.bgEnd();
@@ -4933,7 +5082,10 @@ factories.controls = function createControls(modules) {
         poll: 'tb_poll_interval_val',
         duration: 'tb_min_duration_val',
         l1Except: modules.config.L1_EXCEPT_STORAGE_KEY,
-        token: modules.config.TOKEN_STORAGE_KEY
+        token: modules.config.TOKEN_STORAGE_KEY,
+        emailRecipient: 'tb_email_recipient',
+        emailWebAppUrl: modules.config.EMAIL_WEB_APP_URL_STORAGE_KEY,
+        emailWebhookToken: modules.config.EMAIL_WEBHOOK_TOKEN_STORAGE_KEY
     };
     const RESPONSIVE_STYLE_ID = 'tb-fetch-responsive-style';
     const RESPONSIVE_CSS = `
@@ -5362,6 +5514,37 @@ factories.controls = function createControls(modules) {
             modules.config.L1_EXCEPT = value;
             localStorage.setItem(FETCH_STORAGE_KEYS.l1Except, value);
         };
+        const emailInput = document.createElement('input');
+        emailInput.id = 'tb-fetch-email-recipient';
+        emailInput.className = 'tbp-control-input';
+        emailInput.type = 'email';
+        emailInput.placeholder = 'name@example.com';
+        emailInput.value = localStorage.getItem(FETCH_STORAGE_KEYS.emailRecipient) || '';
+        emailInput.title = 'Email nhận thông báo';
+        emailInput.setAttribute('aria-label', 'Email nhận thông báo');
+        emailInput.onchange = event => localStorage.setItem(FETCH_STORAGE_KEYS.emailRecipient, String(event.target.value || '').trim());
+
+        const emailEndpointInput = document.createElement('input');
+        emailEndpointInput.id = 'tb-fetch-email-endpoint';
+        emailEndpointInput.className = 'tbp-control-input';
+        emailEndpointInput.type = 'url';
+        emailEndpointInput.placeholder = 'https://script.google.com/macros/s/.../exec';
+        emailEndpointInput.value = localStorage.getItem(FETCH_STORAGE_KEYS.emailWebAppUrl) || '';
+        emailEndpointInput.title = 'Google Apps Script Web App URL của tài khoản bạn';
+        emailEndpointInput.setAttribute('aria-label', 'Google Apps Script Web App URL');
+        emailEndpointInput.onchange = event => localStorage.setItem(FETCH_STORAGE_KEYS.emailWebAppUrl, String(event.target.value || '').trim());
+
+        const emailSecretInput = document.createElement('input');
+        emailSecretInput.id = 'tb-fetch-email-secret';
+        emailSecretInput.className = 'tbp-control-input';
+        emailSecretInput.type = 'password';
+        emailSecretInput.autocomplete = 'new-password';
+        emailSecretInput.placeholder = 'Nhập secret riêng của bạn';
+        emailSecretInput.value = localStorage.getItem(FETCH_STORAGE_KEYS.emailWebhookToken) || '';
+        emailSecretInput.title = 'Webhook secret phải trùng với WEBHOOK_TOKEN trong Apps Script';
+        emailSecretInput.setAttribute('aria-label', 'Webhook secret');
+        emailSecretInput.onchange = event => localStorage.setItem(FETCH_STORAGE_KEYS.emailWebhookToken, String(event.target.value || '').trim());
+
         const appendField = (labelText, input) => {
             const field = document.createElement('label');
             field.className = 'tbp-fetch-settings-field';
@@ -5376,9 +5559,12 @@ factories.controls = function createControls(modules) {
         appendField('Poll interval (ms)', pollInput);
         appendField('Thời lượng tối thiểu (giây)', durationInput);
         appendField('L1 Except', l1ExceptInput);
+        appendField('Email nhận thông báo', emailInput);
+        appendField('Google Apps Script Web App URL', emailEndpointInput);
+        appendField('Webhook Secret', emailSecretInput);
         const hint = document.createElement('div');
         hint.className = 'tbp-fetch-settings-hint';
-        hint.textContent = 'Nhập các giá trị L1 cần bỏ qua, phân cách bằng dấu phẩy.';
+        hint.textContent = 'Email dùng chung công tắc Fetch Task. Nhập email, Web App URL và Webhook Secret của chính bạn; để trống một trong các trường thì không gửi email. Các cấu hình được lưu riêng trong trình duyệt, không nằm trong mã nguồn Git.';
         wrapper.appendChild(hint);
         if (settingsToggle)
             settingsToggle.style.display = isActive ? '' : 'none';
