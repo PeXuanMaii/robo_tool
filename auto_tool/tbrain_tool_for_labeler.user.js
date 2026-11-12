@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tbrain_tool_for_labeler
 // @namespace    tbrain-master
-// @version      25.0.1
+// @version      25.0.2
 // @description  Groq AI auto-fill + Auto-fetch (parallel acquire, bounded retries) + status panel + watchdog + email/Telegram alerts + central settings
 // @match        https://*.tbrain.ai/*
 // @run-at       document-start
@@ -3819,11 +3819,13 @@ factories.notifications = function createNotifications(modules) {
             // 2. Fallback sang fetch nếu GM_xmlhttpRequest không tồn tại hoặc chạy thất bại
             try {
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), timeoutMs || 15000);               
+                const timeout = setTimeout(() => controller.abort(), timeoutMs || 15000);  
+                const isAppsScript = /^https:\/\/script\.google(usercontent)?\.com\//.test(url);             
                 const response = await fetch(url, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': isAppsScript ? 'text/plain;charset=utf-8' : 'application/json' },
                     body: JSON.stringify(payload),
+                    redirect: 'follow',
                     signal: controller.signal
                 });               
                 clearTimeout(timeout);
