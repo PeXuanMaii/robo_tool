@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         tbrain_tool_for_labeler
 // @namespace    tbrain-master
-// @version      25.0.2
-// @description  Groq AI auto-fill + Auto-fetch (parallel acquire, bounded retries) + status panel + watchdog + email/Telegram alerts + central settings
+// @version      25.1.0
+// @description  Groq AI auto-fill + Auto-fetch (parallel acquire, bounded retries) + status panel + watchdog + keep-awake (silent audio, wake lock) + email/Telegram alerts + central settings
 // @match        https://*.tbrain.ai/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -50,7 +50,7 @@ factories.config = function createConfig(modules) {
      * ===================================================================== */
     // ==================== CONFIG: GROQ API ====================
     const GROQ_API_KEY = "";
-    const VERSION = '25.0.0';
+    const VERSION = '25.1.0';
     const PROJECT_ID = "cfbe006a-9012-41bc-ba3c-afa8a3338139";
     const TOKEN_RETRY_INTERVAL = 60000;
     const API_BASE = "https://api.tbrain.ai";
@@ -278,6 +278,9 @@ factories.settings = function createSettings(modules) {
         autoAcquire: { key: 'tb_cfg_auto_acquire', codec: 'json', type: 'bool', def: true, section: 'acquire', label: 'Tự động nhận task', input: 'checkbox' },
         acquireConcurrency: { key: 'tb_cfg_acquire_concurrency', codec: 'raw', type: 'int', min: 1, max: 6, def: 3, section: 'acquire', label: 'Nhận song song (số task cùng lúc)', input: 'number' },
         acquireMaxRetries: { key: 'tb_cfg_acquire_max_retries', codec: 'raw', type: 'int', min: 0, max: 6, def: 3, section: 'acquire', label: 'Thử lại tối đa (lỗi mạng/5xx/429)', input: 'number', hint: 'Lỗi chắc chắn như 409/403 sẽ dừng ngay, không thử lại.' },
+        keepAwakeAudio: { key: 'tb_cfg_keepawake_audio', codec: 'json', type: 'bool', def: false, section: 'keepawake', label: 'Phát âm thanh siêu nhỏ (giữ tab hoạt động)', input: 'checkbox', hint: 'Chỉ chạy khi Fetch Task đang ON. Tab sẽ hiện biểu tượng loa; trình duyệt ít cho tab ngủ hơn.' },
+        keepAwakeLevel: { key: 'tb_cfg_keepawake_level', codec: 'raw', type: 'int', min: 1, max: 20, def: 3, section: 'keepawake', label: 'Mức tín hiệu âm thanh (1–20)', input: 'number', hint: 'Tăng nếu tab không hiện biểu tượng loa. Mức càng cao càng dễ nghe thấy.' },
+        keepAwakeScreen: { key: 'tb_cfg_keepawake_screen', codec: 'json', type: 'bool', def: false, section: 'keepawake', label: 'Giữ màn hình/máy thức (Wake Lock)', input: 'checkbox', hint: 'Giữ màn hình sáng khi Fetch ON và tab đang hiển thị; tốn điện hơn.' },
         watchdogEnabled: { key: 'tb_cfg_watchdog_enabled', codec: 'json', type: 'bool', def: true, section: 'watchdog', label: 'Cảnh báo khi tool "chết lặng"', input: 'checkbox' },
         watchdogSilenceSeconds: { key: 'tb_cfg_watchdog_silence_s', codec: 'raw', type: 'int', min: 60, max: 3600, def: 300, section: 'watchdog', label: 'Cảnh báo sau (giây không poll được)', input: 'number' },
         alertRepeatMinutes: { key: 'tb_cfg_alert_repeat_min', codec: 'raw', type: 'int', min: 5, max: 240, def: 15, section: 'watchdog', label: 'Nhắc lại cảnh báo mỗi (phút)', input: 'number' },
@@ -291,7 +294,7 @@ factories.settings = function createSettings(modules) {
         groqApiKey: { key: 'tb_groq_api_key_custom', codec: 'json', type: 'string', maxLen: 500, def: '', secret: true, section: 'ai', label: 'Groq API Key', input: 'password' }
     };
     const SECTION_TITLES = {
-        monitor: 'Fetch Task', acquire: 'Nhận task', watchdog: 'Cảnh báo chết lặng',
+        monitor: 'Fetch Task', acquire: 'Nhận task', keepawake: 'Giữ tab hoạt động', watchdog: 'Cảnh báo chết lặng',
         email: 'Email (Google Apps Script)', telegram: 'Telegram Bot', ai: 'AI'
     };
     function lsGet(key) {
@@ -505,6 +508,10 @@ factories.monitorState = function createMonitorState(modules) {
             telegram: { lastAt: 0, ok: null, error: '' }
         },
         watchdog: { alerting: false, since: 0, lastAlertAt: 0, alertCount: 0, lastGapMs: 0, lastGapAt: 0 },
+        keepAwake: {
+            audio: { state: 'off', since: 0, error: '', lostAt: 0, lastReason: '', recoveries: 0, lastRecoveryAt: 0, deviceChanges: 0, lastDeviceChangeAt: 0 },
+            wake: { state: 'off', since: 0, error: '', reacquired: 0 }
+        },
         events: []
     };
     function event(level, text) {
@@ -3819,13 +3826,13 @@ factories.notifications = function createNotifications(modules) {
             // 2. Fallback sang fetch nếu GM_xmlhttpRequest không tồn tại hoặc chạy thất bại
             try {
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), timeoutMs || 15000);  
-                const isAppsScript = /^https:\/\/script\.google(usercontent)?\.com\//.test(url);             
+                const timeout = setTimeout(() => controller.abort(), timeoutMs || 15000);               
+                // Apps Script không trả lời preflight: gửi text/plain (request đơn giản) thì không bị chặn CORS.
+                const isAppsScript = /^https:\/\/script\.google(usercontent)?\.com\//i.test(url);
                 const response = await fetch(url, {
                     method: 'POST',
                     headers: { 'Content-Type': isAppsScript ? 'text/plain;charset=utf-8' : 'application/json' },
                     body: JSON.stringify(payload),
-                    redirect: 'follow',
                     signal: controller.signal
                 });               
                 clearTimeout(timeout);
@@ -4611,6 +4618,10 @@ factories.watchdog = function createWatchdog(modules) {
     let stalledSince = 0;
     const fmtDuration = ms => modules.notifications.fmtDuration(ms);
     const fmtClock = ms => new Date(ms).toLocaleTimeString();
+    function keepAwakeHint() {
+        const a = modules.monitorState.state.keepAwake.audio;
+        return `Keep-awake: ${modules.settings.get('keepAwakeAudio') ? 'âm thanh "' + a.state + '"' + (a.recoveries ? `, đã tự khôi phục ${a.recoveries} lần` : '') : 'đang TẮT (bật ở Cài đặt → Giữ tab hoạt động để giảm nguy cơ tab bị ngủ)'}.`;
+    }
 
     // Nguyên nhân dễ hiểu từ trạng thái poll hiện tại.
     function diagnose() {
@@ -4663,7 +4674,7 @@ factories.watchdog = function createWatchdog(modules) {
             modules.monitorState.event('warn', `Tab bị tạm dừng ~${fmtDuration(elapsed)}`);
             void modules.notifications.notifyAlert('gap', {
                 short: `Tab bị tạm dừng ~${fmtDuration(elapsed)} (${fmtClock(wall - elapsed)} → ${fmtClock(wall)}). Có thể đã bỏ lỡ task.`,
-                text: `Tab/trình duyệt bị tạm dừng khoảng ${fmtDuration(elapsed)} (từ ${fmtClock(wall - elapsed)} đến ${fmtClock(wall)}).\nTrong lúc đó tool không poll nên có thể đã bỏ lỡ task.\nGợi ý: giữ tab ở foreground, tắt tối ưu pin cho trình duyệt, hoặc dùng cài đặt "không ngủ tab".`
+                text: `Tab/trình duyệt bị tạm dừng khoảng ${fmtDuration(elapsed)} (từ ${fmtClock(wall - elapsed)} đến ${fmtClock(wall)}).\nTrong lúc đó tool không poll nên có thể đã bỏ lỡ task.\nGợi ý: giữ tab ở foreground, tắt tối ưu pin cho trình duyệt, hoặc dùng cài đặt "không ngủ tab".\n${keepAwakeHint()}`
             });
             return;
         }
@@ -4717,6 +4728,284 @@ factories.watchdog = function createWatchdog(modules) {
         get init() { return init; },
         get check() { return check; },
         get diagnose() { return diagnose; }
+    };
+};
+
+// MODULE: keepAwake
+/**
+ * keepAwake
+ * Best-effort measures so the browser/OS does not put the Tbrain tab to sleep while Fetch Task is ON:
+ *   1) near-silent tone via Web Audio (browser treats the tab as "playing audio" and throttles/discards it less),
+ *   2) Screen Wake Lock (keeps screen/system awake; optional, costs battery),
+ *   3) self-check every few seconds: audio context state, audio clock progress and signal presence;
+ *      if audio stopped it is recreated; audio-device changes also rebuild it.
+ * Status (playing / stopped / recovered...) is published to monitorState for the status panel.
+ * Limit: cannot keep a machine awake that the user shuts down/sleeps, and cannot run while the whole tab is frozen.
+ * Dependencies: monitorState, runtime, settings.
+ * Module state stays in this closure; cross-module mutable bindings use live accessors.
+ */
+factories.keepAwake = function createKeepAwake(modules) {
+    'use strict';
+    const CHECK_MS = 5000;                 // chu kỳ tự kiểm tra
+    const TONE_HZ = 20;                    // dưới ngưỡng nghe của tai người
+    const GAIN_UNIT = 0.0005;              // mức 1 ≈ -66 dBFS; mức mặc định 3 ≈ -56 dBFS (trên ngưỡng "im lặng" của trình duyệt, không nghe được)
+    const MIN_PEAK = 1e-5;                 // biên độ tối thiểu ở analyser để coi là "có tín hiệu"
+    const UNLOCK_EVENTS = ['pointerdown', 'keydown', 'touchstart'];
+    const KA = () => modules.monitorState.state.keepAwake;
+    const A = () => KA().audio;
+    const Wk = () => KA().wake;
+    const ev = (level, text) => modules.monitorState.event(level, text);
+    const monitorOn = () => modules.monitorState.state.monitor === 'running';
+    const wantAudio = () => monitorOn() && !!modules.settings.get('keepAwakeAudio');
+    const wantScreen = () => monitorOn() && !!modules.settings.get('keepAwakeScreen');
+    const toneGain = () => modules.settings.get('keepAwakeLevel') * GAIN_UNIT;
+
+    let ctx = null, gainNode = null, osc = null, analyser = null, samples = null;
+    let lastCheck = { ctxTime: 0, wall: 0 };
+    let sentinel = null;
+    let unlockBound = false;
+    let deviceTimer = null;
+    let loopTimer = null;
+    let initialized = false;
+    let chain = Promise.resolve();
+    // Mọi thao tác bất đồng bộ chạy tuần tự để không dẫm lên nhau (tự kiểm tra, đổi thiết bị, đổi cài đặt).
+    const enqueue = fn => (chain = chain.then(fn, fn).catch(error => modules.logger.console.warn('[KeepAwake] lỗi:', error)));
+
+    function setAudio(state, error) {
+        const a = A();
+        if (a.state !== state) { a.state = state; a.since = Date.now(); }
+        a.error = error || '';
+    }
+    function setWake(state, error) {
+        const w = Wk();
+        if (w.state !== state) { w.state = state; w.since = Date.now(); }
+        w.error = error || '';
+    }
+    const race = (promise, ms) => Promise.race([Promise.resolve(promise).catch(() => { }), modules.runtime.bgSleep(ms)]);
+
+    /* ---------------------------------------------------------------------
+     * AUDIO
+     * --------------------------------------------------------------------- */
+    function buildAudio() {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC)
+            throw new Error('Trình duyệt không hỗ trợ Web Audio');
+        let created;
+        try { created = new AC({ latencyHint: 'playback' }); }
+        catch (_) { created = new AC(); }
+        ctx = created;
+        gainNode = ctx.createGain();
+        gainNode.gain.value = toneGain();
+        osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = TONE_HZ;
+        analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        samples = new Float32Array(analyser.fftSize);
+        osc.connect(gainNode);
+        gainNode.connect(analyser);
+        analyser.connect(ctx.destination);
+        osc.start();
+        const mine = ctx;
+        // Trình duyệt tự đổi trạng thái (suspended/interrupted/closed) hoặc đổi thiết bị phát: kiểm tra ngay, không đợi chu kỳ.
+        mine.onstatechange = () => { if (mine === ctx) void enqueue(reconcile); };
+        if (typeof mine.addEventListener === 'function')
+            mine.addEventListener('sinkchange', () => { if (mine === ctx) onDeviceChange('thiết bị phát đã đổi (sinkchange)'); });
+    }
+    async function teardownAudio() {
+        const old = ctx;
+        ctx = null; gainNode = null; analyser = null; samples = null;
+        const oldOsc = osc;
+        osc = null;
+        try { if (oldOsc) { oldOsc.stop(); oldOsc.disconnect(); } } catch (_) { }
+        try { if (old && old.state !== 'closed') await race(old.close(), 800); } catch (_) { }
+    }
+    function resetProgress() {
+        lastCheck = { ctxTime: ctx ? ctx.currentTime : 0, wall: Date.now() };
+    }
+    async function startAudio() {
+        if (!ctx || ctx.state === 'closed')
+            buildAudio();
+        gainNode.gain.value = toneGain();
+        if (ctx.state !== 'running')
+            await race(ctx.resume(), 800); // chưa có thao tác người dùng: resume() treo, nên không chờ vô hạn
+        resetProgress();
+        return ctx.state === 'running';
+    }
+    // Kiểm tra âm thanh có thật sự đang chạy: trạng thái, đồng hồ âm thanh có tiến, có tín hiệu ra.
+    function audioHealth() {
+        if (!ctx)
+            return { ok: false, reason: 'chưa có ngữ cảnh âm thanh' };
+        if (ctx.state !== 'running')
+            return { ok: false, reason: `ngữ cảnh âm thanh ở trạng thái "${ctx.state}"` };
+        const now = Date.now();
+        const wallSec = (now - lastCheck.wall) / 1000;
+        const ctxSec = ctx.currentTime - lastCheck.ctxTime;
+        lastCheck = { ctxTime: ctx.currentTime, wall: now };
+        if (wallSec >= 3 && ctxSec < wallSec * 0.5)
+            return { ok: false, reason: `đồng hồ âm thanh không chạy (${ctxSec.toFixed(1)}s/${wallSec.toFixed(1)}s)` };
+        analyser.getFloatTimeDomainData(samples);
+        let peak = 0;
+        for (let i = 0; i < samples.length; i++)
+            peak = Math.max(peak, Math.abs(samples[i]));
+        if (peak < MIN_PEAK)
+            return { ok: false, reason: 'không có tín hiệu âm thanh' };
+        return { ok: true };
+    }
+    function markHealthy() {
+        const a = A();
+        if (a.lostAt) {
+            a.recoveries++;
+            a.lastRecoveryAt = Date.now();
+            const downSec = Math.round((Date.now() - a.lostAt) / 1000);
+            a.lostAt = 0;
+            setAudio('recovered');
+            ev('ok', `Âm thanh keep-awake đã tự khôi phục (lần ${a.recoveries}, sau ${downSec}s)`);
+        }
+        else if (a.state !== 'recovered') {
+            setAudio('playing');
+        }
+    }
+    function markLost(reason) {
+        const a = A();
+        if (!a.lostAt) {
+            a.lostAt = Date.now();
+            ev('warn', `Âm thanh keep-awake bị dừng: ${reason}`);
+        }
+        a.lastReason = reason;
+        setAudio('stopped', reason);
+    }
+    function bindUnlock() {
+        if (unlockBound || typeof document === 'undefined') return;
+        unlockBound = true;
+        const handler = () => {
+            UNLOCK_EVENTS.forEach(name => document.removeEventListener(name, handler, true));
+            unlockBound = false;
+            void enqueue(reconcile);
+        };
+        UNLOCK_EVENTS.forEach(name => document.addEventListener(name, handler, true));
+    }
+    // Khôi phục: nếu chỉ bị suspended thì resume; ngược lại huỷ và dựng lại.
+    async function recoverAudio() {
+        const a = A();
+        if (ctx && ctx.state === 'suspended') {
+            await race(ctx.resume(), 800);
+            resetProgress();
+            if (ctx && ctx.state === 'running') { markHealthy(); return; }
+        }
+        else {
+            await teardownAudio();
+            if (await startAudio()) { markHealthy(); return; }
+        }
+        // Vẫn chưa chạy được: nếu chưa từng chạy thì đang chờ thao tác đầu tiên, nếu đã từng thì là "bị dừng".
+        if (a.lostAt) setAudio('stopped', a.lastReason);
+        else setAudio('waiting_gesture');
+        bindUnlock();
+    }
+    async function reconcileAudio() {
+        const a = A();
+        if (!wantAudio()) {
+            if (ctx) await teardownAudio();
+            if (a.state !== 'off') { a.lostAt = 0; setAudio('off'); }
+            return;
+        }
+        try {
+            if (!ctx) {
+                if (await startAudio()) markHealthy();
+                else { setAudio(a.lostAt ? 'stopped' : 'waiting_gesture', a.lastReason); bindUnlock(); }
+                return;
+            }
+            gainNode.gain.value = toneGain(); // đổi mức tín hiệu có hiệu lực ngay
+            const health = audioHealth();
+            if (health.ok) { markHealthy(); return; }
+            if (a.state === 'playing' || a.state === 'recovered') markLost(health.reason);
+            else if (a.state === 'stopped') a.lastReason = health.reason;
+            await recoverAudio();
+        }
+        catch (error) {
+            setAudio('error', error && error.message ? error.message : String(error));
+            if (ctx) await teardownAudio();
+        }
+    }
+    // Thiết bị âm thanh đổi (cắm/rút tai nghe, Bluetooth...): dựng lại âm thanh sau một nhịp ngắn cho hệ thống ổn định.
+    function onDeviceChange(why) {
+        clearTimeout(deviceTimer);
+        deviceTimer = setTimeout(() => {
+            deviceTimer = null;
+            const a = A();
+            a.deviceChanges++;
+            a.lastDeviceChangeAt = Date.now();
+            ev('info', `Thiết bị âm thanh thay đổi${why ? ': ' + why : ''}`);
+            if (!wantAudio()) return;
+            void enqueue(async () => {
+                markLost('đổi thiết bị âm thanh');
+                await teardownAudio();
+                if (await startAudio()) markHealthy();
+                else { setAudio('stopped', 'đổi thiết bị âm thanh'); bindUnlock(); }
+            });
+        }, 600);
+    }
+
+    /* ---------------------------------------------------------------------
+     * SCREEN WAKE LOCK (tự thả khi tab ẩn: xin lại khi tab hiện lại)
+     * --------------------------------------------------------------------- */
+    async function releaseWake() {
+        const old = sentinel;
+        sentinel = null;
+        try { if (old && !old.released) await old.release(); } catch (_) { }
+    }
+    async function reconcileScreen() {
+        const w = Wk();
+        if (!wantScreen()) {
+            if (sentinel) await releaseWake();
+            if (w.state !== 'off') setWake('off');
+            return;
+        }
+        if (!('wakeLock' in navigator)) { setWake('unsupported'); return; }
+        if (sentinel && !sentinel.released) { setWake('active'); return; }
+        if (document.visibilityState !== 'visible') { setWake(w.state === 'active' || w.state === 'released' ? 'released' : 'waiting_visible'); return; }
+        try {
+            const reacquire = w.state === 'released' || w.state === 'waiting_visible';
+            const lock = await navigator.wakeLock.request('screen');
+            sentinel = lock;
+            lock.addEventListener('release', () => {
+                if (sentinel === lock) { sentinel = null; setWake('released'); void enqueue(reconcile); }
+            });
+            if (reacquire) { w.reacquired++; ev('info', 'Wake Lock đã được xin lại'); }
+            setWake('active');
+        }
+        catch (error) {
+            setWake('error', `${error && error.name ? error.name : 'Error'}: ${error && error.message ? error.message : error}`);
+        }
+    }
+    async function reconcile() {
+        await reconcileAudio();
+        await reconcileScreen();
+    }
+    function loop() {
+        void enqueue(reconcile);
+        loopTimer = modules.runtime.bgSetTimeout(loop, CHECK_MS);
+    }
+    function init() {
+        if (initialized) return;
+        initialized = true;
+        modules.settings.subscribe(name => {
+            if (name === 'fetchActive' || String(name).startsWith('keepAwake')) void enqueue(reconcile);
+        });
+        try {
+            if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function')
+                navigator.mediaDevices.addEventListener('devicechange', () => onDeviceChange(''));
+        }
+        catch (_) { }
+        document.addEventListener('visibilitychange', () => { void enqueue(reconcile); });
+        modules.environment.W.tbKeepAwakeStatus = () => JSON.parse(JSON.stringify(KA()));
+        loopTimer = modules.runtime.bgSetTimeout(loop, CHECK_MS);
+    }
+    return {
+        get init() { return init; },
+        // Chạy một lượt tự kiểm tra ngay (dùng cho kiểm thử và nút "kiểm tra lại").
+        get check() { return () => enqueue(reconcile); },
+        get onDeviceChange() { return onDeviceChange; }
     };
 };
 
@@ -8656,13 +8945,41 @@ factories.monitorStatusView = function createMonitorStatusView(modules) {
         if (s.consecutiveFailures > 0) return `${dot} Lỗi poll ×${s.consecutiveFailures} · ${s.failureKind}`;
         if (s.phase === 'rate_limited') return `${dot} Đang chờ rate limit`;
         const acq = s.acquiring > 0 ? ` · đang nhận ${s.acquiring}` : '';
-        return `${dot} ${s.lastSuccessAt ? ago(s.lastSuccessAt) : 'đang poll...'} · ${s.seen} task${acq}`;
+        const kaBad = modules.settings.get('keepAwakeAudio') && ['stopped', 'error', 'waiting_gesture'].includes(s.keepAwake.audio.state) ? ' · 🔇' : '';
+        return `${dot} ${s.lastSuccessAt ? ago(s.lastSuccessAt) : 'đang poll...'} · ${s.seen} task${acq}${kaBad}`;
     }
     function channelRow(name, label, info, status) {
         if (!status.configured) return row(label, 'chưa cấu hình', 'tbms-dim');
         if (!status.enabled) return row(label, 'đã tắt', 'tbms-dim');
         if (!info.lastAt) return row(label, 'sẵn sàng (chưa gửi)', 'tbms-dim');
         return row(label, info.ok ? `✓ ${ago(info.lastAt)}` : `✗ ${esc(info.error)} (${ago(info.lastAt)})`, info.ok ? 'tbms-ok' : 'tbms-bad');
+    }
+    function keepAwakeRows(s) {
+        const a = s.keepAwake.audio, w = s.keepAwake.wake;
+        const rows = [];
+        const audioText = {
+            playing: ['🔊 đang phát', 'tbms-ok'],
+            recovered: [`🔊 đã tự khôi phục (${a.recoveries} lần, gần nhất ${ago(a.lastRecoveryAt)})`, 'tbms-ok'],
+            stopped: [`🔇 BỊ DỪNG: ${esc(a.error || a.lastReason || 'không rõ')} — đang thử khôi phục`, 'tbms-bad'],
+            waiting_gesture: ['⏳ chờ bạn bấm vào trang một lần (trình duyệt chặn tự phát)', 'tbms-warn'],
+            error: [`✗ lỗi: ${esc(a.error)}`, 'tbms-bad'],
+            off: ['tắt', 'tbms-dim']
+        }[a.state] || ['tắt', 'tbms-dim'];
+        rows.push(row('Keep-awake: âm thanh', audioText[0] + (a.state !== 'off' && a.since ? ` <span class="tbms-dim">(${ago(a.since)})</span>` : ''), audioText[1]));
+        if (a.recoveries && a.state !== 'recovered' && a.state !== 'off')
+            rows.push(row('Số lần tự khôi phục', `${a.recoveries} (gần nhất ${ago(a.lastRecoveryAt)})`, 'tbms-warn'));
+        if (a.deviceChanges)
+            rows.push(row('Đổi thiết bị âm thanh', `${a.deviceChanges} lần (gần nhất ${ago(a.lastDeviceChangeAt)})`));
+        const wakeText = {
+            active: ['🖥 đang giữ máy/màn hình thức', 'tbms-ok'],
+            waiting_visible: ['⏳ chờ tab hiển thị', 'tbms-warn'],
+            released: ['bị hệ thống thả — sẽ xin lại khi tab hiện', 'tbms-warn'],
+            unsupported: ['trình duyệt không hỗ trợ', 'tbms-warn'],
+            error: [`✗ ${esc(w.error)}`, 'tbms-bad'],
+            off: ['tắt', 'tbms-dim']
+        }[w.state] || ['tắt', 'tbms-dim'];
+        rows.push(row('Keep-awake: Wake Lock', wakeText[0] + (w.reacquired ? ` <span class="tbms-dim">(xin lại ${w.reacquired} lần)</span>` : ''), wakeText[1]));
+        return rows.join('');
     }
     function detailHtml(s) {
         const level = health(s);
@@ -8687,6 +9004,7 @@ factories.monitorStatusView = function createMonitorStatusView(modules) {
         }
         parts.push(row('Watchdog', s.watchdog.alerting ? `ĐANG CẢNH BÁO từ ${new Date(s.watchdog.since).toLocaleTimeString()}` : 'bình thường', s.watchdog.alerting ? 'tbms-bad' : 'tbms-ok'));
         if (s.watchdog.lastGapAt) parts.push(row('Lần tab tạm dừng gần nhất', `${modules.notifications.fmtDuration(s.watchdog.lastGapMs)} (${ago(s.watchdog.lastGapAt)})`, 'tbms-warn'));
+        parts.push(keepAwakeRows(s));
         parts.push('<div class="tbms-h">Kênh nhận tin</div>');
         parts.push(channelRow('email', 'Email', s.channels.email, status.email));
         parts.push(channelRow('telegram', 'Telegram', s.channels.telegram, status.telegram));
@@ -8777,6 +9095,7 @@ factories.bootstrap = function createBootstrap(modules) {
         modules.earnings.start();
         void modules.notifications.ensurePermission();
         modules.watchdog.init();
+        modules.keepAwake.init();
         modules.logger.console.log('tbrain_tool_for_labeler ready.' +
             (modules.runtime.bgTimer.usingWorker
                 ? ' Worker timers ON (background execution remains best-effort).'
@@ -8804,6 +9123,7 @@ factories.bootstrap = function createBootstrap(modules) {
     modules.notifications = factories.notifications(modules);
     modules.taskMonitor = factories.taskMonitor(modules);
     modules.watchdog = factories.watchdog(modules);
+    modules.keepAwake = factories.keepAwake(modules);
     modules.controls = factories.controls(modules);
     modules.monitorStatusView = factories.monitorStatusView(modules);
     modules.earnings = factories.earnings(modules);
