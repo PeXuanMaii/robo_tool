@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         tbrain_tool_for_labeler
 // @namespace    tbrain-master
-// @version      24.0.15
-// @description  Groq AI auto-fill + Auto-fetch + instant task alerts (notification + email, with detailed acquire errors)
+// @version      25.0.0
+// @description  Groq AI auto-fill + Auto-fetch (parallel acquire, bounded retries) + status panel + watchdog + email/Telegram alerts + central settings
 // @match        https://*.tbrain.ai/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -11,6 +11,7 @@
 // @grant        GM.notification
 // @grant        unsafeWindow
 // @connect      api.groq.com
+// @connect      api.telegram.org
 // @connect      *
 // ==/UserScript==
 
@@ -37,7 +38,7 @@ factories.environment = function createEnvironment(modules) {
 // MODULE: config
 /**
  * config
- * Single configuration boundary: IDs, selectors, schemas, thresholds and persisted-setting defaults.
+ * Single configuration boundary: IDs, selectors, schemas and fixed thresholds. User-editable settings live in `settings`.
  * Dependencies: none.
  * Module state stays in this closure; cross-module mutable bindings use live accessors.
  */
@@ -49,13 +50,8 @@ factories.config = function createConfig(modules) {
      * ===================================================================== */
     // ==================== CONFIG: GROQ API ====================
     const GROQ_API_KEY = "";
-    const TOKEN_STORAGE_KEY = 'tb_groq_api_key_custom';
-    const L1_EXCEPT_STORAGE_KEY = 'tb_fetch_l1_except';
-    const DEFAULT_L1_EXCEPT = 'Automotive and Transport';
+    const VERSION = '25.0.0';
     const PROJECT_ID = "cfbe006a-9012-41bc-ba3c-afa8a3338139";
-    let POLL_INTERVAL = 2000;
-    let MIN_DURATION_SECONDS = 7200;
-    let L1_EXCEPT = DEFAULT_L1_EXCEPT;
     const TOKEN_RETRY_INTERVAL = 60000;
     const API_BASE = "https://api.tbrain.ai";
     const API_URL = `${API_BASE}/api/v1/tasks/pool?projectId=${PROJECT_ID}&page=1&pageSize=20`;
@@ -64,23 +60,21 @@ factories.config = function createConfig(modules) {
     const EARNINGS_RATE_VND_PER_HOUR = 50000;
     const CLICK_URL = "https://beacon.tbrain.ai";
     const REQUEST_TIMEOUT = 5000;
-    const NOTIFY_ON_FIRST_POLL = true;
     const MAX_SEEN_IDS = 5000;
-    const AUTO_ACQUIRE = true;
-    // Email delivery via Google Apps Script Web App. Paste the deployed URL here.
-    // Per-user email integration settings are stored locally in the browser, never committed to Git.
-    const EMAIL_WEB_APP_URL = '';
-    const EMAIL_WEBHOOK_TOKEN = '';
-    const EMAIL_WEB_APP_URL_STORAGE_KEY = 'tb_email_web_app_url';
-    const EMAIL_WEBHOOK_TOKEN_STORAGE_KEY = 'tb_email_webhook_token';
     const EMAIL_POLL_INTERVAL = 15000;
     const PERF_LOG = true;
-    const RATE_LIMIT_RESERVE = 30;
     const MIN_SAFE_POLL_INTERVAL = 2500;
-    const MAX_SAFE_POLL_INTERVAL = 15000;
     const RATE_LIMIT_FALLBACK_WAIT = 30000;
     const RATE_LIMIT_SAFETY_MS = 1000;
-    const MAX_CONCURRENT_ACQUIRE = 2;
+    // Nhận task: timeout mỗi lần gọi, backoff, ngân sách thử lại và số lượt "thử lại ở poll kế".
+    const ACQUIRE_TIMEOUT_MS = 10000;
+    const ACQUIRE_RETRY_BASE_MS = 300;
+    const ACQUIRE_RETRY_BUDGET_MS = 20000;
+    const MAX_REATTEMPT_ROUNDS = 1;
+    // Watchdog: chu kỳ kiểm tra; khoảng cách giữa 2 lần kiểm tra lớn hơn GAP = tab/timer bị đóng băng.
+    const WATCHDOG_TICK_MS = 10000;
+    const WATCHDOG_GAP_MS = 60000;
+    const EVENT_LOG_SIZE = 30;
     /* ==================== AI PROMPT / ANNOTATION SCHEMA ==================== */
     const SKILL_GROUPS = [
         ['Pick and Place / Object Handling', 'simply moving, lifting or transferring objects without changing them'],
@@ -222,18 +216,10 @@ factories.config = function createConfig(modules) {
         get SKILL_NAMES() { return SKILL_NAMES; },
         get DIFFICULTIES() { return DIFFICULTIES; },
         get PROJECT_ID() { return PROJECT_ID; },
-        get POLL_INTERVAL() { return POLL_INTERVAL; },
-        set POLL_INTERVAL(value) { POLL_INTERVAL = value; },
-        get MIN_DURATION_SECONDS() { return MIN_DURATION_SECONDS; },
-        set MIN_DURATION_SECONDS(value) { MIN_DURATION_SECONDS = value; },
-        get L1_EXCEPT() { return L1_EXCEPT; },
-        set L1_EXCEPT(value) { L1_EXCEPT = String(value == null ? '' : value); },
-        get L1_EXCEPT_STORAGE_KEY() { return L1_EXCEPT_STORAGE_KEY; },
-        get DEFAULT_L1_EXCEPT() { return DEFAULT_L1_EXCEPT; },
+        get VERSION() { return VERSION; },
         get GROQ() { return GROQ; },
         get PANEL() { return PANEL; },
         get CACHE() { return CACHE; },
-        get TOKEN_STORAGE_KEY() { return TOKEN_STORAGE_KEY; },
         get GROQ_API_KEY() { return GROQ_API_KEY; },
         get DEFAULT_SKILL() { return DEFAULT_SKILL; },
         get PROMPT_RULES() { return PROMPT_RULES; },
@@ -253,12 +239,286 @@ factories.config = function createConfig(modules) {
         get EXTRA_HOURS_API_URL() { return EXTRA_HOURS_API_URL; },
         get EARNINGS_RATE_VND_PER_HOUR() { return EARNINGS_RATE_VND_PER_HOUR; },
         get TOKEN_RETRY_INTERVAL() { return TOKEN_RETRY_INTERVAL; },
-        get AUTO_ACQUIRE() { return AUTO_ACQUIRE; },
-        get EMAIL_WEB_APP_URL() { return (localStorage.getItem(EMAIL_WEB_APP_URL_STORAGE_KEY) || EMAIL_WEB_APP_URL).trim(); },
-        get EMAIL_WEBHOOK_TOKEN() { return (localStorage.getItem(EMAIL_WEBHOOK_TOKEN_STORAGE_KEY) || EMAIL_WEBHOOK_TOKEN).trim(); },
-        get EMAIL_WEB_APP_URL_STORAGE_KEY() { return EMAIL_WEB_APP_URL_STORAGE_KEY; },
-        get EMAIL_WEBHOOK_TOKEN_STORAGE_KEY() { return EMAIL_WEBHOOK_TOKEN_STORAGE_KEY; },
+        get ACQUIRE_TIMEOUT_MS() { return ACQUIRE_TIMEOUT_MS; },
+        get ACQUIRE_RETRY_BASE_MS() { return ACQUIRE_RETRY_BASE_MS; },
+        get ACQUIRE_RETRY_BUDGET_MS() { return ACQUIRE_RETRY_BUDGET_MS; },
+        get MAX_REATTEMPT_ROUNDS() { return MAX_REATTEMPT_ROUNDS; },
+        get WATCHDOG_TICK_MS() { return WATCHDOG_TICK_MS; },
+        get WATCHDOG_GAP_MS() { return WATCHDOG_GAP_MS; },
+        get EVENT_LOG_SIZE() { return EVENT_LOG_SIZE; },
+        get MAX_SEEN_IDS() { return MAX_SEEN_IDS; },
         get EMAIL_POLL_INTERVAL() { return EMAIL_POLL_INTERVAL; }
+    };
+};
+
+// MODULE: settings
+/**
+ * settings
+ * Single place for every persisted user setting: schema, validation, defaults, legacy-key compatibility,
+ * export/import (JSON) and change notifications. No DOM. Other modules never touch these localStorage keys directly.
+ * Dependencies: config.
+ * Module state stays in this closure; cross-module mutable bindings use live accessors.
+ */
+factories.settings = function createSettings(modules) {
+    'use strict';
+    const EXPORT_FORMAT = 'tbrain-tool-settings';
+    const EXPORT_VERSION = 1;
+    const WORKING_TIME_PREFIX = 'tb-working-time-settings:';
+    const listeners = new Set();
+    /* ---------------------------------------------------------------------
+     * Schema. `key` + `codec` keep the pre-25 localStorage format so existing users lose nothing.
+     *   codec 'json': JSON.stringify/parse        codec 'raw': plain string
+     *   type: bool | int | string
+     * --------------------------------------------------------------------- */
+    const SCHEMA = {
+        fetchActive: { key: 'tb_fetch_active_state', codec: 'json', type: 'bool', def: true, transient: true, section: 'monitor', label: 'Fetch Task bật', input: 'checkbox' },
+        pollIntervalMs: { key: 'tb_poll_interval_val', codec: 'raw', type: 'int', min: 500, max: 600000, def: 2000, section: 'monitor', label: 'Poll interval (ms)', input: 'number' },
+        minDurationSeconds: { key: 'tb_min_duration_val', codec: 'raw', type: 'int', min: 0, max: 10000000, def: 7200, section: 'monitor', label: 'Thời lượng tối thiểu (giây)', input: 'number' },
+        l1Except: { key: 'tb_fetch_l1_except', codec: 'raw', type: 'string', maxLen: 500, def: 'Automotive and Transport', section: 'monitor', label: 'L1 Except', input: 'text', placeholder: 'Automotive and Transport, ...', hint: 'L1 cần bỏ qua, phân cách bằng dấu phẩy' },
+        autoAcquire: { key: 'tb_cfg_auto_acquire', codec: 'json', type: 'bool', def: true, section: 'acquire', label: 'Tự động nhận task', input: 'checkbox' },
+        acquireConcurrency: { key: 'tb_cfg_acquire_concurrency', codec: 'raw', type: 'int', min: 1, max: 6, def: 3, section: 'acquire', label: 'Nhận song song (số task cùng lúc)', input: 'number' },
+        acquireMaxRetries: { key: 'tb_cfg_acquire_max_retries', codec: 'raw', type: 'int', min: 0, max: 6, def: 3, section: 'acquire', label: 'Thử lại tối đa (lỗi mạng/5xx/429)', input: 'number', hint: 'Lỗi chắc chắn như 409/403 sẽ dừng ngay, không thử lại.' },
+        watchdogEnabled: { key: 'tb_cfg_watchdog_enabled', codec: 'json', type: 'bool', def: true, section: 'watchdog', label: 'Cảnh báo khi tool "chết lặng"', input: 'checkbox' },
+        watchdogSilenceSeconds: { key: 'tb_cfg_watchdog_silence_s', codec: 'raw', type: 'int', min: 60, max: 3600, def: 300, section: 'watchdog', label: 'Cảnh báo sau (giây không poll được)', input: 'number' },
+        alertRepeatMinutes: { key: 'tb_cfg_alert_repeat_min', codec: 'raw', type: 'int', min: 5, max: 240, def: 15, section: 'watchdog', label: 'Nhắc lại cảnh báo mỗi (phút)', input: 'number' },
+        emailEnabled: { key: 'tb_cfg_email_enabled', codec: 'json', type: 'bool', def: true, section: 'email', label: 'Gửi email', input: 'checkbox' },
+        emailRecipient: { key: 'tb_email_recipient', codec: 'raw', type: 'string', maxLen: 320, def: '', section: 'email', label: 'Email nhận thông báo', input: 'email', placeholder: 'name@example.com' },
+        emailWebAppUrl: { key: 'tb_email_web_app_url', codec: 'raw', type: 'string', maxLen: 1000, def: '', section: 'email', label: 'Apps Script URL', input: 'url', placeholder: 'https://script.google.com/macros/s/.../exec', pattern: /^https:\/\/.+/i },
+        emailWebhookToken: { key: 'tb_email_webhook_token', codec: 'raw', type: 'string', maxLen: 500, def: '', secret: true, section: 'email', label: 'Webhook Secret', input: 'password', placeholder: 'Secret riêng của bạn' },
+        telegramEnabled: { key: 'tb_cfg_telegram_enabled', codec: 'json', type: 'bool', def: true, section: 'telegram', label: 'Gửi Telegram', input: 'checkbox' },
+        telegramBotToken: { key: 'tb_cfg_telegram_bot_token', codec: 'raw', type: 'string', maxLen: 200, def: '', secret: true, section: 'telegram', label: 'Telegram Bot Token', input: 'password', placeholder: '123456:ABC... (từ @BotFather)', pattern: /^\d{3,}:[A-Za-z0-9_-]{20,}$/ },
+        telegramChatId: { key: 'tb_cfg_telegram_chat_id', codec: 'raw', type: 'string', maxLen: 64, def: '', section: 'telegram', label: 'Telegram Chat ID', input: 'text', placeholder: '123456789 hoặc @channel', pattern: /^(-?\d{3,}|@[A-Za-z0-9_]{4,})$/ },
+        groqApiKey: { key: 'tb_groq_api_key_custom', codec: 'json', type: 'string', maxLen: 500, def: '', secret: true, section: 'ai', label: 'Groq API Key', input: 'password' }
+    };
+    const SECTION_TITLES = {
+        monitor: 'Fetch Task', acquire: 'Nhận task', watchdog: 'Cảnh báo chết lặng',
+        email: 'Email (Google Apps Script)', telegram: 'Telegram Bot', ai: 'AI'
+    };
+    function lsGet(key) {
+        try { return localStorage.getItem(key); } catch (_) { return null; }
+    }
+    function lsSet(key, value) {
+        try { localStorage.setItem(key, value); return true; } catch (_) { return false; }
+    }
+    function lsDel(key) {
+        try { localStorage.removeItem(key); } catch (_) { }
+    }
+    // Validate/coerce a candidate value. Returns { ok, value } or { ok:false, error }.
+    function coerce(def, value) {
+        if (def.type === 'bool') {
+            if (typeof value === 'boolean') return { ok: true, value };
+            if (value === 'true' || value === 1) return { ok: true, value: true };
+            if (value === 'false' || value === 0) return { ok: true, value: false };
+            return { ok: false, error: 'cần true/false' };
+        }
+        if (def.type === 'int') {
+            const n = typeof value === 'number' ? value : (typeof value === 'string' && /^\s*-?\d+\s*$/.test(value) ? Number(value) : NaN);
+            if (!Number.isInteger(n)) return { ok: false, error: 'cần là số nguyên' };
+            if (n < def.min || n > def.max) return { ok: false, error: `phải trong khoảng ${def.min}–${def.max}` };
+            return { ok: true, value: n };
+        }
+        if (typeof value !== 'string') return { ok: false, error: 'cần là chuỗi' };
+        const text = value.trim();
+        if (def.maxLen && text.length > def.maxLen) return { ok: false, error: `dài quá ${def.maxLen} ký tự` };
+        if (text && def.pattern && !def.pattern.test(text)) return { ok: false, error: 'sai định dạng' };
+        return { ok: true, value: text };
+    }
+    function decode(def, raw) {
+        if (raw === null || raw === undefined) return undefined;
+        if (def.codec === 'json') {
+            try { return JSON.parse(raw); } catch (_) { return raw; } // tolerate pre-JSON legacy raw strings
+        }
+        return raw;
+    }
+    function encode(def, value) {
+        return def.codec === 'json' ? JSON.stringify(value) : String(value);
+    }
+    function defaultFor(name) {
+        const def = SCHEMA[name];
+        if (name === 'groqApiKey' && typeof modules.config.GROQ_API_KEY === 'string')
+            return modules.config.GROQ_API_KEY;
+        return def.def;
+    }
+    function get(name) {
+        const def = SCHEMA[name];
+        if (!def) throw new Error('Unknown setting: ' + name);
+        const stored = decode(def, lsGet(def.key));
+        if (stored === undefined) return defaultFor(name);
+        const checked = coerce(def, stored);
+        return checked.ok ? checked.value : defaultFor(name);
+    }
+    function set(name, value) {
+        const def = SCHEMA[name];
+        if (!def) return { ok: false, error: 'Unknown setting: ' + name };
+        const checked = coerce(def, value);
+        if (!checked.ok) return checked;
+        if (!lsSet(def.key, encode(def, checked.value)))
+            return { ok: false, error: 'Không ghi được localStorage' };
+        emit(name, checked.value);
+        return { ok: true, value: checked.value };
+    }
+    function reset(name) {
+        const def = SCHEMA[name];
+        if (!def) return;
+        lsDel(def.key);
+        emit(name, get(name));
+    }
+    function emit(name, value) {
+        for (const fn of Array.from(listeners)) {
+            try { fn(name, value); } catch (error) { modules.logger.console.warn('[Settings] listener lỗi:', error); }
+        }
+    }
+    function subscribe(fn) {
+        listeners.add(fn);
+        return () => listeners.delete(fn);
+    }
+    function names() { return Object.keys(SCHEMA); }
+    function isSecret(name) { return !!(SCHEMA[name] && SCHEMA[name].secret); }
+    function snapshot(includeSecrets) {
+        const out = {};
+        for (const name of names()) {
+            if (SCHEMA[name].transient) continue; // trạng thái bật/tắt monitor không thuộc cài đặt xuất/nhập
+            if (isSecret(name) && !includeSecrets) continue;
+            out[name] = get(name);
+        }
+        return out;
+    }
+    function readWorkingTimeSettings() {
+        const out = {};
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && key.startsWith(WORKING_TIME_PREFIX)) {
+                    try { out[key.slice(WORKING_TIME_PREFIX.length)] = JSON.parse(localStorage.getItem(key)); } catch (_) { }
+                }
+            }
+        } catch (_) { }
+        return out;
+    }
+    function exportObject(options = {}) {
+        const includeSecrets = !!options.includeSecrets;
+        return {
+            format: EXPORT_FORMAT,
+            version: EXPORT_VERSION,
+            toolVersion: modules.config.VERSION,
+            exportedAt: new Date().toISOString(),
+            secretsIncluded: includeSecrets,
+            settings: snapshot(includeSecrets),
+            workingTime: readWorkingTimeSettings()
+        };
+    }
+    function exportJson(options) {
+        return JSON.stringify(exportObject(options), null, 2);
+    }
+    // Import validates every field; invalid ones are skipped and reported, never half-applied silently.
+    function importJson(text, options = {}) {
+        const report = { applied: [], skipped: [], unknown: [], workingTime: 0 };
+        let data;
+        try { data = JSON.parse(String(text)); }
+        catch (_) { throw new Error('File không phải JSON hợp lệ'); }
+        if (!data || data.format !== EXPORT_FORMAT || !data.settings || typeof data.settings !== 'object')
+            throw new Error('Không phải file cài đặt của tool này');
+        if (Number(data.version) > EXPORT_VERSION)
+            throw new Error('File được xuất từ phiên bản mới hơn, hãy cập nhật tool trước');
+        const allowSecrets = options.applySecrets !== false;
+        for (const [name, value] of Object.entries(data.settings)) {
+            if (!SCHEMA[name]) { report.unknown.push(name); continue; }
+            if (SCHEMA[name].transient) continue;
+            if (isSecret(name) && !allowSecrets) { report.skipped.push({ name, reason: 'bỏ qua khóa bí mật' }); continue; }
+            const result = set(name, value);
+            if (result.ok) report.applied.push(name);
+            else report.skipped.push({ name, reason: result.error });
+        }
+        if (data.workingTime && typeof data.workingTime === 'object' && !Array.isArray(data.workingTime)) {
+            for (const [projectId, value] of Object.entries(data.workingTime)) {
+                if (!projectId || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+                if (lsSet(WORKING_TIME_PREFIX + projectId, JSON.stringify(value))) report.workingTime++;
+            }
+        }
+        return report;
+    }
+    function resetAll(options = {}) {
+        for (const name of names()) {
+            if (SCHEMA[name].transient) continue;
+            if (isSecret(name) && !options.includeSecrets) continue;
+            reset(name);
+        }
+    }
+    let initialized = false;
+    function init() {
+        if (initialized) return;
+        initialized = true;
+        const W = modules.environment.W;
+        W.tbExportSettings = options => exportJson(options);
+        W.tbImportSettings = (text, options) => importJson(text, options);
+    }
+    return {
+        get SCHEMA() { return SCHEMA; },
+        get SECTION_TITLES() { return SECTION_TITLES; },
+        get get() { return get; },
+        get set() { return set; },
+        get reset() { return reset; },
+        get resetAll() { return resetAll; },
+        get subscribe() { return subscribe; },
+        get names() { return names; },
+        get isSecret() { return isSecret; },
+        get snapshot() { return snapshot; },
+        get exportJson() { return exportJson; },
+        get importJson() { return importJson; },
+        init
+    };
+};
+
+// MODULE: monitorState
+/**
+ * monitorState
+ * Shared, observable-by-polling runtime state of the task monitor (poll health, counters, channels, recent events).
+ * Written by taskMonitor / notifications / watchdog; read by the status view. No DOM, no network.
+ * Dependencies: config.
+ * Module state stays in this closure; cross-module mutable bindings use live accessors.
+ */
+factories.monitorState = function createMonitorState(modules) {
+    'use strict';
+    const state = {
+        monitor: 'off',            // off | running
+        phase: 'idle',             // idle | polling | waiting_token | rate_limited
+        startedAt: 0,              // lúc bật monitor
+        lastPollAt: 0,
+        lastPollOk: null,
+        lastPollStatus: '',
+        lastPollMs: 0,
+        lastSuccessAt: 0,
+        pollCount: 0,
+        pollOkCount: 0,
+        consecutiveFailures: 0,
+        failureKind: '',           // no_token | auth | http | network | timeout | bad_json | bad_shape | exception
+        poolSize: 0,
+        seen: 0,
+        detected: 0,
+        acquired: 0,
+        acquireFailed: 0,
+        acquiring: 0,              // số task đang nhận
+        lastError: null,           // { at, kind, message }
+        token: null,               // { source, expiresAt }
+        channels: {
+            email: { lastAt: 0, ok: null, error: '' },
+            telegram: { lastAt: 0, ok: null, error: '' }
+        },
+        watchdog: { alerting: false, since: 0, lastAlertAt: 0, alertCount: 0, lastGapMs: 0, lastGapAt: 0 },
+        events: []
+    };
+    function event(level, text) {
+        state.events.unshift({ at: Date.now(), level, text: String(text) });
+        if (state.events.length > modules.config.EVENT_LOG_SIZE)
+            state.events.length = modules.config.EVENT_LOG_SIZE;
+    }
+    function setError(kind, message) {
+        state.lastError = { at: Date.now(), kind, message: String(message || '').slice(0, 300) };
+    }
+    return {
+        get state() { return state; },
+        get event() { return event; },
+        get setError() { return setError; }
     };
 };
 
@@ -582,7 +842,7 @@ factories.runtime = function createRuntime(modules) {
 /**
  * storage
  * IndexedDB cache, approved Pass examples, local storage and Groq key access.
- * Dependencies: config, environment, logger, media.
+ * Dependencies: config, environment, logger, media, settings.
  * Module state stays in this closure; cross-module mutable bindings use live accessors.
  */
 factories.storage = function createStorage(modules) {
@@ -890,12 +1150,11 @@ factories.storage = function createStorage(modules) {
     }
     // ==================== QUẢN LÝ GROQ API KEY BẰNG LOCALSTORAGE ====================
     function getStoredApiKey() {
-        // Ưu tiên lấy key người dùng đã nhập trong UI, nếu không có thì lấy biến cứng mặc định
-        const saved = localStorage.getItem(modules.config.TOKEN_STORAGE_KEY);
-        return saved ? JSON.parse(saved) : (typeof modules.config.GROQ_API_KEY !== 'undefined' ? modules.config.GROQ_API_KEY : "");
+        // Key người dùng nhập trong UI; nếu chưa có thì dùng mặc định trong config (do module settings quyết định)
+        return modules.settings.get('groqApiKey');
     }
     function saveStoredApiKey(key) {
-        localStorage.setItem(modules.config.TOKEN_STORAGE_KEY, JSON.stringify(key.trim()));
+        modules.settings.set('groqApiKey', String(key || ''));
     }
     let initialized = false;
     function init() {
@@ -3341,85 +3600,72 @@ factories.auth = function createAuth(modules) {
 // MODULE: notifications
 /**
  * notifications
- * Task alerts: audio, browser/userscript-manager notifications and email.
- * Events: detected (task appeared in pool), acquired, acquire_failed (with detailed error), rework.
- * Dependencies: config, taskMonitor.
+ * Alerts for task events. Three outputs: audio, device notification, and message channels (email + Telegram).
+ * Batching rule: one digest message per round (detected / results); every failure keeps its own detailed message.
+ * Dependencies: config, monitorState, settings, taskMonitor.
  * Module state stays in this closure; cross-module mutable bindings use live accessors.
  */
 factories.notifications = function createNotifications(modules) {
     'use strict';
     let audioCtx = null;
     let deniedLogged = false;
-    let emailConfigWarned = false;
+    const warnedOnce = new Set();
+    const log = () => modules.taskMonitor.log;
 
+    function warnOnce(key, ...args) {
+        if (warnedOnce.has(key)) return;
+        warnedOnce.add(key);
+        log().warn(...args);
+    }
     function getUserscriptNotification() {
-        if (typeof GM_notification === 'function')
-            return GM_notification;
-        if (typeof GM !== 'undefined' && GM && typeof GM.notification === 'function')
-            return GM.notification.bind(GM);
+        if (typeof GM_notification === 'function') return GM_notification;
+        if (typeof GM !== 'undefined' && GM && typeof GM.notification === 'function') return GM.notification.bind(GM);
         return null;
     }
-
     function getPermissionState() {
-        if (getUserscriptNotification())
-            return 'userscript';
-        if (!('Notification' in window) || typeof Notification !== 'function'
-            || typeof Notification.permission !== 'string')
+        if (getUserscriptNotification()) return 'userscript';
+        if (!('Notification' in window) || typeof Notification !== 'function' || typeof Notification.permission !== 'string')
             return 'unsupported';
         return Notification.permission;
     }
-
     async function ensurePermission() {
         const state = getPermissionState();
-        if (state === 'granted' || state === 'userscript')
-            return true;
-        if (state === 'denied') {
-            if (!deniedLogged) {
-                modules.taskMonitor.log.warn("Notification permission denied.");
-                deniedLogged = true;
-            }
-            return false;
+        if (state === 'granted' || state === 'userscript') return true;
+        if (state === 'denied' && !deniedLogged) {
+            log().warn('Notification permission denied.');
+            deniedLogged = true;
         }
         return false;
     }
-
     async function enableNotifications() {
         unlockAudio();
         const state = getPermissionState();
-        if (state !== 'default')
-            return state;
-        if (typeof Notification.requestPermission !== 'function')
-            return 'unsupported';
+        if (state !== 'default') return state;
+        if (typeof Notification.requestPermission !== 'function') return 'unsupported';
         try {
             const permission = await Notification.requestPermission();
             return typeof permission === 'string' ? permission : getPermissionState();
         }
         catch (error) {
-            modules.taskMonitor.log.error('Notification permission request failed:', error);
+            log().error('Notification permission request failed:', error);
             return getPermissionState();
         }
     }
-
     function unlockAudio() {
         try {
             const AC = window.AudioContext || window.webkitAudioContext;
-            if (AC && !audioCtx)
-                audioCtx = new AC();
-            if (audioCtx && audioCtx.state === "suspended")
-                void audioCtx.resume();
+            if (AC && !audioCtx) audioCtx = new AC();
+            if (audioCtx && audioCtx.state === 'suspended') void audioCtx.resume();
         }
         catch (error) {
-            modules.taskMonitor.log.warn('Audio notification could not be enabled:', error);
+            log().warn('Audio notification could not be enabled:', error);
         }
     }
-
-    // Âm khác nhau theo sự kiện: phát hiện 880Hz, nhận được 1175Hz, lỗi 330Hz (dài hơn).
+    // Âm khác nhau theo sự kiện: phát hiện 880Hz, nhận được 1175Hz, lỗi/cảnh báo 330Hz (dài hơn).
     function beep(frequency = 880, durationSec = 0.15) {
         try {
-            if (!audioCtx)
-                unlockAudio();
-            if (!audioCtx || audioCtx.state !== "running")
-                return;
+            if (!audioCtx) unlockAudio();
+            if (!audioCtx || audioCtx.state !== 'running') return;
             const start = audioCtx.currentTime;
             const osc = audioCtx.createOscillator();
             const gain = audioCtx.createGain();
@@ -3430,311 +3676,308 @@ factories.notifications = function createNotifications(modules) {
             osc.stop(start + durationSec);
         }
         catch (error) {
-            modules.taskMonitor.log.warn('Task notification sound failed:', error);
+            log().warn('Task notification sound failed:', error);
         }
     }
-
     function openTask(notification) {
         try {
-            if (typeof window.open === 'function')
-                window.open(modules.config.CLICK_URL, '_blank');
-            if (typeof window.focus === 'function')
-                window.focus();
+            if (typeof window.open === 'function') window.open(modules.config.CLICK_URL, '_blank');
+            if (typeof window.focus === 'function') window.focus();
         }
         catch (error) {
-            modules.taskMonitor.log.warn('Could not open Tbrain from notification:', error);
+            log().warn('Could not open Tbrain from notification:', error);
         }
-        if (notification && typeof notification.close === 'function')
-            notification.close();
+        if (notification && typeof notification.close === 'function') notification.close();
     }
 
     /* ---------------------------------------------------------------------
-     * Nội dung thông báo / mail
+     * Formatting helpers
      * --------------------------------------------------------------------- */
-    const formatHours = seconds => Number.isFinite(Number(seconds)) && seconds !== null && seconds !== ''
-        ? (Number(seconds) / 3600).toFixed(2)
-        : 'Unknown';
-
-    // Rút gọn thông điệp lỗi từ body server (JSON {message|error|detail} hoặc text thuần).
+    const hoursOf = seconds => (seconds !== null && seconds !== undefined && seconds !== '' && Number.isFinite(Number(seconds)))
+        ? (Number(seconds) / 3600).toFixed(2) : '?';
+    const fmtTime = ms => new Date(ms).toLocaleTimeString();
+    const fmtDuration = ms => {
+        const s = Math.max(0, Math.round(ms / 1000));
+        if (s < 90) return `${s} giây`;
+        const m = Math.round(s / 60);
+        return m < 90 ? `${m} phút` : `${Math.floor(m / 60)} giờ ${m % 60} phút`;
+    };
     function extractServerMessage(body) {
         const raw = String(body || '').trim();
-        if (!raw)
-            return '';
+        if (!raw) return '';
         try {
             const parsed = JSON.parse(raw);
             if (parsed && typeof parsed === 'object') {
                 for (const key of ['message', 'error', 'detail', 'errorMessage', 'msg']) {
                     const value = parsed[key];
-                    if (typeof value === 'string' && value.trim())
-                        return value.trim().slice(0, 200);
-                    if (value && typeof value === 'object' && typeof value.message === 'string')
-                        return value.message.trim().slice(0, 200);
+                    if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 200);
+                    if (value && typeof value === 'object' && typeof value.message === 'string') return value.message.trim().slice(0, 200);
                 }
             }
         }
         catch (_) { }
         return raw.replace(/\s+/g, ' ').slice(0, 200);
     }
-
     function summarizeError(result) {
-        if (!result)
-            return 'Không rõ nguyên nhân';
+        if (!result) return 'Không rõ nguyên nhân';
         if (result.kind === 'http') {
             const serverMessage = extractServerMessage(result.responseBody);
             return `HTTP ${result.status}${result.statusText ? ' ' + result.statusText : ''}${serverMessage ? ' - ' + serverMessage : ''}`;
         }
-        if (result.kind === 'timeout')
-            return 'Hết thời gian chờ phản hồi' + (result.message ? ` (${result.message})` : '');
-        if (result.kind === 'stopped')
-            return 'Task monitor đã bị dừng khi đang nhận task';
+        if (result.kind === 'timeout') return 'Hết thời gian chờ phản hồi' + (result.message ? ` (${result.message})` : '');
+        if (result.kind === 'stopped') return 'Task monitor đã bị dừng khi đang nhận task';
         return result.message || 'Lỗi mạng hoặc lỗi không xác định';
     }
+    const taskLine = info => `• ${info.id} · ${hoursOf(info.durationSeconds)}h${info.envL1 ? ' · L1: ' + info.envL1 : ''}`;
 
-    function getNotificationContent(kind, item, result) {
-        const idLine = `ID: ${item.id}`;
-        const hoursLine = `Thời lượng: ${formatHours(item.durationSeconds)} giờ`;
-        const l1Line = item.envL1 ? `\nL1: ${item.envL1}` : '';
-        if (kind === 'detected') {
-            return {
-                title: '🔔 Phát hiện Task mới!',
-                body: `${idLine}\n${hoursLine}${l1Line}${modules.config.AUTO_ACQUIRE ? '\nĐang tự động nhận task...' : ''}`,
-                tag: `tbrain-detected-${item.id}`
-            };
-        }
-        if (kind === 'acquired') {
-            return {
-                title: '🚀 Đã nhận Task mới thành công!',
-                body: `${idLine}\n${hoursLine}`,
-                tag: `tbrain-acquired-${item.id}`
-            };
-        }
-        if (kind === 'failed') {
-            return {
-                title: '❌ Nhận Task thất bại',
-                body: `${idLine}\n${hoursLine}\nLỗi: ${summarizeError(result)}`,
-                tag: `tbrain-acquire-failed-${item.id}`,
-                timeout: 20000
-            };
-        }
-        return {
-            title: '↩️ Task bị QC trả về (Rework)',
-            body: `${idLine}\nTrạng thái: ${item.status || 'Rework'}`,
-            tag: `tbrain-rework-${item.id}`
-        };
-    }
-
+    /* ---------------------------------------------------------------------
+     * Device notification (userscript manager first, Notification API fallback). Never throws.
+     * --------------------------------------------------------------------- */
     async function showBrowserNotification(content) {
-        const options = {
-            body: content.body,
-            tag: content.tag,
-            renotify: true,
-            data: { url: modules.config.CLICK_URL }
-        };
+        const options = { body: content.body, tag: content.tag, renotify: true, data: { url: modules.config.CLICK_URL } };
         const serviceWorker = navigator.serviceWorker;
         if (serviceWorker && typeof serviceWorker.getRegistration === 'function') {
             try {
                 const registration = await serviceWorker.getRegistration();
                 if (registration && typeof registration.showNotification === 'function') {
-                    try {
-                        await registration.showNotification(content.title, options);
-                        return;
-                    }
-                    catch (error) {
-                        modules.taskMonitor.log.warn('Service-worker notification failed; trying browser notification:', error);
-                    }
+                    try { await registration.showNotification(content.title, options); return; }
+                    catch (error) { log().warn('Service-worker notification failed; trying browser notification:', error); }
                 }
             }
-            catch (error) {
-                modules.taskMonitor.log.warn('Could not access the service-worker registration:', error);
-            }
+            catch (error) { log().warn('Could not access the service-worker registration:', error); }
         }
-        if (typeof Notification !== 'function')
-            throw new Error('Browser Notification API is unavailable');
+        if (typeof Notification !== 'function') throw new Error('Browser Notification API is unavailable');
         const notification = new Notification(content.title, options);
         notification.onclick = event => {
-            if (event && typeof event.preventDefault === 'function')
-                event.preventDefault();
+            if (event && typeof event.preventDefault === 'function') event.preventDefault();
             openTask(notification);
         };
     }
-
-    // Một đường phát thông báo duy nhất: userscript manager -> Notification API (fallback). Không bao giờ throw.
     async function deliverNotification(content) {
         const managerNotify = getUserscriptNotification();
         if (managerNotify) {
             try {
-                const result = managerNotify({
-                    title: content.title,
-                    text: content.body,
-                    tag: content.tag,
-                    timeout: content.timeout || 10000,
-                    onclick: () => openTask()
-                });
-                if (result && typeof result.then === 'function')
-                    await result;
+                const result = managerNotify({ title: content.title, text: content.body, tag: content.tag, timeout: content.timeout || 10000, onclick: () => openTask() });
+                if (result && typeof result.then === 'function') await result;
                 return true;
             }
             catch (error) {
-                modules.taskMonitor.log.error('Userscript-manager notification failed:', error);
-                if ('Notification' in window && typeof Notification === 'function'
-                    && Notification.permission === 'granted') {
-                    try {
-                        await showBrowserNotification(content);
-                        return true;
-                    }
-                    catch (fallbackError) {
-                        modules.taskMonitor.log.error('Browser notification fallback failed:', fallbackError);
-                    }
+                log().error('Userscript-manager notification failed:', error);
+                if ('Notification' in window && typeof Notification === 'function' && Notification.permission === 'granted') {
+                    try { await showBrowserNotification(content); return true; }
+                    catch (fallbackError) { log().error('Browser notification fallback failed:', fallbackError); }
                 }
                 return false;
             }
         }
         if (!(await ensurePermission())) {
-            modules.taskMonitor.log.info('[NOTIFICATION PERMISSION REQUIRED]', content);
+            log().info('[NOTIFICATION PERMISSION REQUIRED]', content);
             return false;
         }
-        try {
-            await showBrowserNotification(content);
-            return true;
-        }
-        catch (error) {
-            modules.taskMonitor.log.error('Browser notification failed:', error);
-            return false;
-        }
+        try { await showBrowserNotification(content); return true; }
+        catch (error) { log().error('Browser notification failed:', error); return false; }
     }
 
     /* ---------------------------------------------------------------------
-     * Email (Google Apps Script Web App)
+     * Message channels. A message = { subject, text }. Each sender resolves { ok, skipped?, reason? } and never throws.
      * --------------------------------------------------------------------- */
-    const EMAIL_TITLES = {
-        pool: 'Phát hiện task mới trong Task Pool',
-        acquired: 'Đã nhận task mới thành công',
-        acquire_failed: 'Nhận task THẤT BẠI',
-        rework: 'Task bị QC trả về (Rework)'
-    };
-
-    function buildEmailBody(item, eventType, result) {
-        const lines = [
-            `Sự kiện: ${EMAIL_TITLES[eventType] || eventType}`,
-            `Task ID: ${item.id || 'N/A'}`,
-            item.status ? `Trạng thái: ${item.status}` : '',
-            item.envL1 ? `Môi trường (L1): ${item.envL1}` : '',
-            Number.isFinite(Number(item.durationSeconds)) && item.durationSeconds != null ? `Thời lượng: ${formatHours(item.durationSeconds)} giờ` : ''
-        ];
-        if (eventType === 'pool')
-            lines.push(`Tự động nhận: ${modules.config.AUTO_ACQUIRE ? 'BẬT (đang nhận task, sẽ có mail kết quả)' : 'TẮT'}`);
-        if (eventType === 'acquired' && result) {
-            lines.push('Kết quả: THÀNH CÔNG');
-            lines.push(`HTTP status: ${result.status}`);
-            lines.push(`Thời gian nhận: ${result.elapsedMs} ms`);
-        }
-        if (eventType === 'acquire_failed' && result) {
-            lines.push('Kết quả: THẤT BẠI');
-            lines.push(`Tóm tắt lỗi: ${summarizeError(result)}`);
-            lines.push(`Loại lỗi: ${result.kind || 'unknown'}`);
-            lines.push(`HTTP status: ${result.status || 'không có (chưa nhận được phản hồi)'}${result.statusText ? ' ' + result.statusText : ''}`);
-            if (result.message)
-                lines.push(`Thông điệp: ${result.message}`);
-            if (result.responseBody)
-                lines.push(`Phản hồi từ server: ${result.responseBody}`);
-            lines.push(`Endpoint: POST ${result.url || 'N/A'}`);
-            lines.push(`Thời gian xử lý: ${result.elapsedMs} ms`);
-            if (result.rateLimit) {
-                const rl = result.rateLimit;
-                lines.push(`Rate limit: còn ${rl.remaining == null ? '?' : rl.remaining}/${rl.limit == null ? '?' : rl.limit}`
-                    + `${rl.resetAt ? ', reset lúc ' + new Date(rl.resetAt).toLocaleTimeString() : ''}`
-                    + `${rl.pauseUntil > Date.now() ? ', đang tạm dừng tới ' + new Date(rl.pauseUntil).toLocaleTimeString() : ''}`);
-            }
-            lines.push(`Trình duyệt online: ${typeof navigator !== 'undefined' && 'onLine' in navigator ? navigator.onLine : 'không rõ'}`);
-        }
-        lines.push(`Thời gian: ${new Date().toLocaleString()}`);
-        return lines.filter(Boolean).join('\n');
+    function gmRequestFn() {
+        if (typeof GM_xmlhttpRequest === 'function') return GM_xmlhttpRequest;
+        if (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') return GM.xmlHttpRequest.bind(GM);
+        return null;
     }
-
-    function sendEmail(item, eventType, result) {
-        // Email dùng chung công tắc Fetch Task. Không có công tắc email riêng.
-        const recipient = String(localStorage.getItem('tb_email_recipient') || '').trim();
-        const endpoint = String(modules.config.EMAIL_WEB_APP_URL || '').trim();
-        const webhookToken = String(modules.config.EMAIL_WEBHOOK_TOKEN || '').trim();
-        if (modules.taskMonitor.stopped)
-            return Promise.resolve(false);
-        if (!recipient || !endpoint || !webhookToken) {
-            if (!emailConfigWarned) {
-                emailConfigWarned = true;
-                modules.taskMonitor.log.warn('[EMAIL] Chưa cấu hình đủ người nhận / Web App URL / token nên sẽ không gửi mail.');
-            }
-            return Promise.resolve(false);
-        }
-        const title = EMAIL_TITLES[eventType] || eventType;
-        const payload = JSON.stringify({
-            token: webhookToken,
-            to: recipient,
-            subject: `[TBrain] ${title} - ${item.id || ''}`,
-            body: buildEmailBody(item, eventType, result)
-        });
-        const gmRequest = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest
-            : (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function' ? GM.xmlHttpRequest.bind(GM) : null);
-        if (!gmRequest) {
-            modules.taskMonitor.log.warn('[EMAIL] Không có GM_xmlhttpRequest nên không gửi được mail:', eventType, item.id);
-            return Promise.resolve(false);
-        }
+    function recordChannel(name, outcome) {
+        if (outcome.skipped) return;
+        const slot = modules.monitorState.state.channels[name];
+        slot.lastAt = Date.now();
+        slot.ok = !!outcome.ok;
+        slot.error = outcome.ok ? '' : String(outcome.reason || '');
+        if (!outcome.ok) modules.monitorState.event('warn', `Gửi ${name} lỗi: ${outcome.reason}`);
+    }
+    function httpPostJson(url, payload, timeoutMs) {
+        const gmRequest = gmRequestFn();
+        if (!gmRequest) return Promise.resolve({ status: 0, error: 'Không có GM_xmlhttpRequest' });
         return new Promise(resolve => {
             try {
                 gmRequest({
-                    method: 'POST', url: endpoint, data: payload,
-                    headers: { 'Content-Type': 'application/json' },
-                    timeout: 15000,
-                    onload: response => {
-                        const ok = response.status >= 200 && response.status < 300;
-                        if (!ok)
-                            modules.taskMonitor.log.warn(`[EMAIL] Gửi mail "${eventType}" thất bại: HTTP ${response.status}`);
-                        resolve(ok);
-                    },
-                    onerror: () => { modules.taskMonitor.log.warn(`[EMAIL] Gửi mail "${eventType}" thất bại: lỗi mạng`); resolve(false); },
-                    ontimeout: () => { modules.taskMonitor.log.warn(`[EMAIL] Gửi mail "${eventType}" thất bại: timeout`); resolve(false); }
+                    method: 'POST', url, data: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }, timeout: timeoutMs,
+                    onload: response => resolve({ status: response.status, text: response.responseText || '' }),
+                    onerror: () => resolve({ status: 0, error: 'lỗi mạng' }),
+                    ontimeout: () => resolve({ status: 0, error: 'timeout' })
                 });
             }
-            catch (error) {
-                modules.taskMonitor.log.warn(`[EMAIL] Gửi mail "${eventType}" thất bại:`, error);
-                resolve(false);
-            }
+            catch (error) { resolve({ status: 0, error: String(error && error.message || error) }); }
         });
+    }
+    function channelConfig() {
+        const s = modules.settings;
+        return {
+            email: {
+                enabled: s.get('emailEnabled'),
+                recipient: s.get('emailRecipient'), url: s.get('emailWebAppUrl'), secret: s.get('emailWebhookToken')
+            },
+            telegram: {
+                enabled: s.get('telegramEnabled'), token: s.get('telegramBotToken'), chatId: s.get('telegramChatId')
+            }
+        };
+    }
+    function getChannelStatus() {
+        const cfg = channelConfig();
+        return {
+            email: { configured: !!(cfg.email.recipient && cfg.email.url && cfg.email.secret), enabled: cfg.email.enabled },
+            telegram: { configured: !!(cfg.telegram.token && cfg.telegram.chatId), enabled: cfg.telegram.enabled }
+        };
+    }
+    async function sendEmailMessage(message) {
+        const cfg = channelConfig().email;
+        if (!cfg.enabled) return { ok: false, skipped: true, reason: 'đã tắt' };
+        if (!cfg.recipient || !cfg.url || !cfg.secret) {
+            warnOnce('email-config', '[EMAIL] Chưa cấu hình đủ người nhận / Web App URL / token nên sẽ không gửi mail.');
+            return { ok: false, skipped: true, reason: 'chưa cấu hình' };
+        }
+        const res = await httpPostJson(cfg.url, { token: cfg.secret, to: cfg.recipient, subject: message.subject, body: message.text }, 15000);
+        const ok = res.status >= 200 && res.status < 300;
+        return ok ? { ok: true } : { ok: false, reason: res.error || `HTTP ${res.status}` };
+    }
+    async function sendTelegramMessage(message) {
+        const cfg = channelConfig().telegram;
+        if (!cfg.enabled) return { ok: false, skipped: true, reason: 'đã tắt' };
+        if (!cfg.token || !cfg.chatId) return { ok: false, skipped: true, reason: 'chưa cấu hình' };
+        const url = `https://api.telegram.org/bot${cfg.token}/sendMessage`;
+        const payload = { chat_id: cfg.chatId, text: `${message.subject}\n\n${message.text}`.slice(0, 4000), disable_web_page_preview: true };
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            const res = await httpPostJson(url, payload, 10000);
+            let body = null;
+            try { body = res.text ? JSON.parse(res.text) : null; } catch (_) { }
+            if (res.status === 200 && body && body.ok) return { ok: true };
+            // Telegram giới hạn tốc độ: chờ đúng retry_after (tối đa 5s) rồi thử lại 1 lần.
+            const retryAfter = body && body.parameters && Number(body.parameters.retry_after);
+            if (res.status === 429 && attempt === 1 && retryAfter > 0 && retryAfter <= 5) {
+                await modules.runtime.bgSleep(retryAfter * 1000 + 100);
+                continue;
+            }
+            // Không bao giờ đưa bot token vào lý do lỗi/log.
+            return { ok: false, reason: res.error || (body && body.description) || `HTTP ${res.status}` };
+        }
+        return { ok: false, reason: 'không rõ' };
+    }
+    // Gửi 1 message qua mọi kênh đang bật, song song. Mặc định bỏ qua khi monitor đã dừng.
+    async function dispatch(message, options = {}) {
+        if (!options.ignoreStopped && modules.taskMonitor.stopped) return { email: { ok: false, skipped: true }, telegram: { ok: false, skipped: true } };
+        const [email, telegram] = await Promise.all([sendEmailMessage(message), sendTelegramMessage(message)]);
+        recordChannel('email', email);
+        recordChannel('telegram', telegram);
+        return { email, telegram };
+    }
+    async function sendTest(channel) {
+        const message = { subject: '[TBrain] Tin nhắn thử', text: `Kênh ${channel} hoạt động.\nThời gian: ${new Date().toLocaleString()}` };
+        const outcome = channel === 'telegram' ? await sendTelegramMessage(message) : await sendEmailMessage(message);
+        recordChannel(channel, outcome);
+        return outcome;
     }
 
     /* ---------------------------------------------------------------------
-     * Sự kiện: mỗi sự kiện = thông báo + mail, gửi song song, không bao giờ throw
+     * Events. Device notification + channels; all failures isolated (allSettled).
      * --------------------------------------------------------------------- */
-    async function notifyTasksDetected(items) {
-        if (!Array.isArray(items) || items.length === 0)
-            return;
+    // Phát hiện: 1 thông báo + 1 tin tổng hợp cho cả đợt (không phải mỗi task một mail).
+    async function notifyTasksDetected(infos) {
+        if (!Array.isArray(infos) || infos.length === 0) return;
         beep(880, 0.15);
-        await Promise.allSettled(items.map(item => Promise.allSettled([
-            deliverNotification(getNotificationContent('detected', item)),
-            sendEmail(item, 'pool')
-        ])));
+        const auto = modules.settings.get('autoAcquire');
+        const n = infos.length;
+        const lines = infos.map(taskLine);
+        const notice = n === 1
+            ? { title: '🔔 Phát hiện Task mới!', body: `ID: ${infos[0].id}\nThời lượng: ${hoursOf(infos[0].durationSeconds)} giờ${infos[0].envL1 ? '\nL1: ' + infos[0].envL1 : ''}${auto ? '\nĐang tự động nhận task...' : ''}`, tag: `tbrain-detected-${infos[0].id}` }
+            : { title: `🔔 Phát hiện ${n} Task mới!`, body: `${lines.join('\n')}${auto ? '\nĐang tự động nhận task...' : ''}`, tag: `tbrain-detected-${infos.map(i => i.id).join('-').slice(0, 80)}` };
+        const message = {
+            subject: n === 1 ? `[TBrain] Phát hiện task mới - ${infos[0].id}` : `[TBrain] Phát hiện ${n} task mới`,
+            text: [`🔔 Phát hiện ${n} task mới trong Task Pool`, `Tự động nhận: ${auto ? 'BẬT (sẽ có tin kết quả)' : 'TẮT'}`, ...lines, `Thời gian: ${new Date().toLocaleString()}`].join('\n')
+        };
+        await Promise.allSettled([deliverNotification(notice), dispatch(message)]);
     }
-
-    async function notifyAcquireSuccess(item, result) {
+    // Nhận thành công: thông báo thiết bị ngay theo từng task. Tin kênh gửi gộp ở notifyRoundSummary.
+    async function notifyAcquireSuccess(info, result) {
         beep(1175, 0.2);
-        await Promise.allSettled([
-            deliverNotification(getNotificationContent('acquired', item, result)),
-            sendEmail(item, 'acquired', result)
-        ]);
+        await Promise.allSettled([deliverNotification({
+            title: '🚀 Đã nhận Task mới thành công!',
+            body: `ID: ${info.id}\nThời lượng: ${hoursOf(info.durationSeconds)} giờ`,
+            tag: `tbrain-acquired-${info.id}`
+        })]);
     }
-
-    async function notifyAcquireFailure(item, result) {
+    function buildFailureMessage(info, result) {
+        const attempts = Array.isArray(result.attempts) ? result.attempts : [];
+        const lines = [
+            `❌ Nhận task THẤT BẠI: ${info.id}`,
+            `Thời lượng: ${hoursOf(info.durationSeconds)} giờ${info.envL1 ? ' · L1: ' + info.envL1 : ''}`,
+            `Tóm tắt lỗi: ${summarizeError(result)}`,
+            `Loại lỗi: ${result.kind || 'unknown'}`,
+            `HTTP status: ${result.status || 'không có (chưa nhận được phản hồi)'}${result.statusText ? ' ' + result.statusText : ''}`
+        ];
+        if (result.message) lines.push(`Thông điệp: ${result.message}`);
+        if (result.responseBody) lines.push(`Phản hồi từ server: ${result.responseBody}`);
+        if (attempts.length > 1 || result.gaveUp) {
+            lines.push(`Số lần thử: ${attempts.length}${result.gaveUp ? ' (đã hết lượt thử cho lỗi tạm thời)' : ''}${result.budgetExceeded ? ' — quá thời gian thử lại cho phép' : ''}`);
+            attempts.forEach(a => lines.push(`  #${a.n}: ${a.status ? 'HTTP ' + a.status : a.kind || 'lỗi'}${a.message ? ' — ' + String(a.message).slice(0, 100) : ''} (${a.ms} ms)`));
+        }
+        if (result.ambiguous) lines.push('⚠ Lần thử trước bị lỗi mạng/5xx nên task CÓ THỂ đã được nhận thành công — hãy kiểm tra My Tasks.');
+        if (result.willRetryNextPoll) lines.push('Tool sẽ thử lại một lần nữa ở lượt poll kế tiếp.');
+        lines.push(`Endpoint: POST ${result.url || 'N/A'}`);
+        lines.push(`Tổng thời gian: ${result.elapsedMs} ms`);
+        if (result.rateLimit) {
+            const rl = result.rateLimit;
+            lines.push(`Rate limit: còn ${rl.remaining == null ? '?' : rl.remaining}/${rl.limit == null ? '?' : rl.limit}${rl.pauseUntil > Date.now() ? ', đang tạm dừng tới ' + fmtTime(rl.pauseUntil) : ''}`);
+        }
+        lines.push(`Trình duyệt online: ${typeof navigator !== 'undefined' && 'onLine' in navigator ? navigator.onLine : 'không rõ'}`);
+        lines.push(`Thời gian: ${new Date().toLocaleString()}`);
+        return { subject: `[TBrain] Nhận task THẤT BẠI - ${info.id}`, text: lines.join('\n') };
+    }
+    // Lỗi: mỗi lỗi một tin riêng, đầy đủ chi tiết. Nếu tool sẽ tự thử lại ở poll sau thì chỉ báo thiết bị (tránh spam).
+    async function notifyAcquireFailure(info, result) {
         beep(330, 0.45);
-        modules.taskMonitor.log.error(`[ACQUIRE FAILED] ${item.id}: ${summarizeError(result)}`, result);
+        log().error(`[ACQUIRE FAILED] ${info.id}: ${summarizeError(result)}`, result);
+        const tasks = [deliverNotification({
+            title: result.willRetryNextPoll ? '⚠️ Nhận Task lỗi — sẽ thử lại' : '❌ Nhận Task thất bại',
+            body: `ID: ${info.id}\nThời lượng: ${hoursOf(info.durationSeconds)} giờ\nLỗi: ${summarizeError(result)}${result.ambiguous ? '\n⚠ Có thể task đã được nhận, kiểm tra My Tasks' : ''}`,
+            tag: `tbrain-acquire-failed-${info.id}`,
+            timeout: 20000
+        })];
+        if (!result.willRetryNextPoll) tasks.push(dispatch(buildFailureMessage(info, result)));
+        await Promise.allSettled(tasks);
+    }
+    // Kết quả cả đợt: 1 tin tổng hợp cho các task nhận được (lỗi đã có tin riêng).
+    async function notifyRoundSummary(round) {
+        const ok = round.successes || [];
+        if (ok.length === 0) return;
+        const failed = round.failures || [];
+        const total = ok.length + failed.length;
+        const lines = [`🚀 Đã nhận ${ok.length}/${total} task thành công`];
+        for (const { info, result } of ok)
+            lines.push(`✅ ${info.id} · ${hoursOf(info.durationSeconds)}h${info.envL1 ? ' · L1: ' + info.envL1 : ''} · ${result.elapsedMs} ms${result.attempts && result.attempts.length > 1 ? ` · lần thử ${result.attempts.length}` : ''}`);
+        if (failed.length) lines.push(`❌ ${failed.length} task thất bại: ${failed.map(f => f.info.id).join(', ')} (xem tin lỗi riêng)`);
+        lines.push(`Thời gian: ${new Date().toLocaleString()}`);
+        await dispatch({
+            subject: ok.length === 1 && total === 1 ? `[TBrain] Đã nhận task thành công - ${ok[0].info.id}` : `[TBrain] Đã nhận ${ok.length}/${total} task`,
+            text: lines.join('\n')
+        });
+    }
+    // Cảnh báo watchdog: kind = stalled | stalled_repeat | recovered | gap
+    async function notifyAlert(kind, payload) {
+        if (kind !== 'recovered') beep(330, 0.6);
+        const titles = { stalled: '🔴 Tool KHÔNG poll được', stalled_repeat: '🔴 Tool vẫn không poll được', recovered: '🟢 Tool đã hoạt động lại', gap: '⏸ Tab bị tạm dừng' };
+        const title = titles[kind] || 'Cảnh báo';
         await Promise.allSettled([
-            deliverNotification(getNotificationContent('failed', item, result)),
-            sendEmail(item, 'acquire_failed', result)
+            deliverNotification({ title, body: payload.short, tag: `tbrain-alert-${kind}`, timeout: 30000 }),
+            dispatch({ subject: `[TBrain] ${title}`, text: `${title}\n${payload.text}\nThời gian: ${new Date().toLocaleString()}` })
         ]);
     }
-
+    // Rework: tin riêng như trước (hiếm, nên không gom).
     async function showReworkNotification(item) {
         await Promise.allSettled([
-            deliverNotification(getNotificationContent('rework', item)),
-            sendEmail(item, 'rework')
+            deliverNotification({ title: '↩️ Task bị QC trả về (Rework)', body: `ID: ${item.id}\nTrạng thái: ${item.status || 'Rework'}`, tag: `tbrain-rework-${item.id}` }),
+            dispatch({
+                subject: `[TBrain] Task bị QC trả về (Rework) - ${item.id}`,
+                text: [`↩️ Task bị QC trả về (Rework)`, `Task ID: ${item.id || 'N/A'}`, item.status ? `Trạng thái: ${item.status}` : '', `Thời gian: ${new Date().toLocaleString()}`].filter(Boolean).join('\n')
+            })
         ]);
     }
 
@@ -3743,32 +3986,34 @@ factories.notifications = function createNotifications(modules) {
         get enableNotifications() { return enableNotifications; },
         get getPermissionState() { return getPermissionState; },
         get activateAudio() { return unlockAudio; },
+        get getChannelStatus() { return getChannelStatus; },
+        get sendTest() { return sendTest; },
         get notifyTasksDetected() { return notifyTasksDetected; },
         get notifyAcquireSuccess() { return notifyAcquireSuccess; },
         get notifyAcquireFailure() { return notifyAcquireFailure; },
-        get sendEmail() { return sendEmail; },
-        get showReworkNotification() { return showReworkNotification; }
+        get notifyRoundSummary() { return notifyRoundSummary; },
+        get notifyAlert() { return notifyAlert; },
+        get showReworkNotification() { return showReworkNotification; },
+        get fmtDuration() { return fmtDuration; }
     };
 };
 
 // MODULE: taskMonitor
 /**
  * taskMonitor
- * Task-pool polling, rate-limit state and task acquisition.
- * Dependencies: auth, config, environment, logger, notifications, runtime.
+ * Task-pool polling, poll-health tracking, rate-limit state, parallel task acquisition with bounded retries.
+ * Dependencies: auth, config, environment, logger, monitorState, notifications, runtime, settings.
  * Module state stays in this closure; cross-module mutable bindings use live accessors.
  */
 factories.taskMonitor = function createTaskMonitor(modules) {
     'use strict';
-    /* ---------------------------------------------------------------------
-     * AUTO-FETCH LOGIC & NETWORK INTERCEPTION
-     * --------------------------------------------------------------------- */
     const log = {
         info: (...a) => modules.logger.console.log("[INFO]", ...a),
         warn: (...a) => modules.logger.console.warn("[WARN]", ...a),
         error: (...a) => modules.logger.console.error("[ERROR]", ...a)
     };
     const now = () => performance.now();
+    const S = () => modules.monitorState.state;
     function perf(label, start) {
         if (modules.config.PERF_LOG)
             log.info(`[PERF] ${label}: ${(now() - start).toFixed(1)} ms`);
@@ -3793,7 +4038,13 @@ factories.taskMonitor = function createTaskMonitor(modules) {
         }
         rateLimitState.lastStatus = response.status;
         if (response.status === 429) {
-            rateLimitState.pauseUntil = Math.max(rateLimitState.pauseUntil, Date.now() + modules.config.RATE_LIMIT_FALLBACK_WAIT + modules.config.RATE_LIMIT_SAFETY_MS);
+            // Ưu tiên Retry-After của server (tối đa 60s); không có thì dùng mức chờ mặc định.
+            const retryAfterRaw = headers.get("retry-after");
+            const retryAfter = retryAfterRaw === null ? NaN : Number(retryAfterRaw);
+            const waitMs = Number.isFinite(retryAfter) && retryAfter >= 0
+                ? Math.min(retryAfter, 60) * 1000
+                : modules.config.RATE_LIMIT_FALLBACK_WAIT;
+            rateLimitState.pauseUntil = Math.max(rateLimitState.pauseUntil, Date.now() + waitMs + modules.config.RATE_LIMIT_SAFETY_MS);
         }
     }
     async function waitForRateLimit() {
@@ -3801,12 +4052,13 @@ factories.taskMonitor = function createTaskMonitor(modules) {
             const waitMs = rateLimitState.pauseUntil - Date.now();
             if (waitMs <= 0)
                 return;
+            S().phase = 'rate_limited';
             await modules.runtime.bgSleep(waitMs);
         }
         throw new Error("Task monitor stopped");
     }
     function getAdaptivePollInterval() {
-        return Math.max(modules.config.POLL_INTERVAL, modules.config.MIN_SAFE_POLL_INTERVAL);
+        return Math.max(modules.settings.get('pollIntervalMs'), modules.config.MIN_SAFE_POLL_INTERVAL);
     }
     function getTaskId(task) {
         if (!task)
@@ -3845,7 +4097,7 @@ factories.taskMonitor = function createTaskMonitor(modules) {
             modules.runtime.bgClearTimeout(timeout);
         }
     }
-    // Thông tin gọn của task dùng cho thông báo / mail.
+    // Thông tin gọn của task dùng cho thông báo / tin nhắn.
     function getTaskInfo(task) {
         const duration = Number(task && task.durationSeconds);
         const envL1 = task && (task.envL1 || task.envl1);
@@ -3855,19 +4107,27 @@ factories.taskMonitor = function createTaskMonitor(modules) {
             envL1: typeof envL1 === "string" ? envL1.trim() : ""
         };
     }
-    // Luôn trả về kết quả chi tiết (không throw) để lỗi nào cũng được báo + gửi mail.
-    async function acquireTask(token, taskObj) {
+
+    /* ---------------------------------------------------------------------
+     * ACQUIRE: một lần gọi (acquireOnce) -> thử lại có giới hạn (acquireWithRetry) -> chạy song song (acquireRound)
+     * --------------------------------------------------------------------- */
+    // Luôn trả về kết quả chi tiết (không throw) để lỗi nào cũng được báo.
+    async function acquireOnce(token, taskObj) {
         const id = getTaskId(taskObj);
         const url = `${modules.config.API_BASE}/api/v1/tasks/${encodeURIComponent(id)}/acquire`;
         const startedAt = now();
         const result = { taskObj, id, ok: false, status: 0, statusText: "", kind: "", message: "", responseBody: "", url, elapsedMs: 0, rateLimit: null };
+        const controller = new AbortController();
+        let timeout = null;
         try {
             await waitForRateLimit();
+            timeout = modules.runtime.bgSetTimeout(() => controller.abort(), modules.config.ACQUIRE_TIMEOUT_MS);
             const response = await modules.auth.origFetch.call(modules.environment.W, url, {
                 method: "POST",
                 headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "*/*" },
                 credentials: "include",
-                body: "{}"
+                body: "{}",
+                signal: controller.signal
             });
             readRateLimitHeaders(response);
             result.ok = response.ok;
@@ -3888,6 +4148,9 @@ factories.taskMonitor = function createTaskMonitor(modules) {
             result.kind = text === "Task monitor stopped" ? "stopped" : (name === "AbortError" ? "timeout" : "network");
             result.message = `${name}: ${text}`;
         }
+        finally {
+            modules.runtime.bgClearTimeout(timeout);
+        }
         result.elapsedMs = Math.round(now() - startedAt);
         result.rateLimit = {
             limit: rateLimitState.limit,
@@ -3897,22 +4160,136 @@ factories.taskMonitor = function createTaskMonitor(modules) {
         };
         return result;
     }
-    // Báo ngay từng kết quả (thành công hoặc thất bại), không chờ cả loạt.
-    async function acquireNew(token, taskList) {
-        let success = 0;
-        for (const taskObj of taskList) {
-            const res = await acquireTask(token, taskObj);
-            const info = getTaskInfo(taskObj);
-            if (res.ok) {
-                success++;
-                void modules.notifications.notifyAcquireSuccess(info, res);
+    // Lỗi tạm thời (đáng thử lại) hay lỗi chắc chắn (dừng ngay: 409 đã bị lấy, 403, 404, 400...)?
+    function isRetryable(result) {
+        if (result.kind === "network" || result.kind === "timeout")
+            return true;
+        if (result.kind === "http")
+            return result.status === 429 || result.status === 408 || result.status === 425 || result.status >= 500;
+        return false;
+    }
+    function backoffMs(attempt) {
+        const base = modules.config.ACQUIRE_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+        return Math.min(3000, base) + Math.floor(Math.random() * 150);
+    }
+    async function acquireWithRetry(token, taskObj) {
+        const maxRetries = modules.settings.get('acquireMaxRetries');
+        const startedAt = now();
+        const attempts = [];
+        let currentToken = token;
+        let refreshedToken = false;
+        let attempt = 0;
+        for (;;) {
+            attempt++;
+            const result = await acquireOnce(currentToken, taskObj);
+            attempts.push({ n: attempt, status: result.status, kind: result.kind, message: result.message, ms: result.elapsedMs });
+            result.attempts = attempts;
+            result.elapsedMs = Math.round(now() - startedAt);
+            if (result.ok || result.kind === "stopped")
+                return result;
+            // Token bị từ chối: loại token đó, thử đúng một lần với token mới (nếu trang đã làm mới).
+            if (result.status === 401 && !refreshedToken) {
+                refreshedToken = true;
+                modules.auth.rejectedTokens.add(currentToken);
+                modules.auth.cachedTokenCandidate = null;
+                const fresh = modules.auth.findToken(true);
+                if (fresh && fresh.token !== currentToken) {
+                    currentToken = fresh.token;
+                    continue;
+                }
+                return result;
             }
-            else {
-                void modules.notifications.notifyAcquireFailure(info, res);
+            const retryable = isRetryable(result);
+            if (!retryable) {
+                // 409 sau một lần thử bị lỗi mạng/5xx: có thể lần trước server đã nhận rồi.
+                result.ambiguous = result.status === 409 && attempts.slice(0, -1).some(a => a.kind === "network" || a.kind === "timeout" || a.status >= 500);
+                return result;
+            }
+            if (attempt > maxRetries) {
+                result.gaveUp = true;
+                return result;
+            }
+            let wait = backoffMs(attempt);
+            if (result.status === 429)
+                wait = Math.max(wait, rateLimitState.pauseUntil - Date.now());
+            if ((now() - startedAt) + wait > modules.config.ACQUIRE_RETRY_BUDGET_MS) {
+                result.gaveUp = true;
+                result.budgetExceeded = true;
+                return result;
+            }
+            await modules.runtime.bgSleep(wait);
+            if (stopped) {
+                result.kind = "stopped";
+                return result;
             }
         }
-        return { success, total: taskList.length };
     }
+    // Chạy tối đa `limit` việc cùng lúc. `worker` không được throw.
+    async function runLimited(items, limit, worker) {
+        let next = 0;
+        const lanes = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+            while (next < items.length) {
+                const item = items[next++];
+                await worker(item);
+            }
+        });
+        await Promise.all(lanes);
+    }
+    const reattempts = new Map();   // id -> số lượt "thử lại ở poll kế" đã dùng
+    const silentRetry = new Set();  // id đang thử lại: không báo "phát hiện" lần nữa
+    let roundSeq = 0;
+    // Nhận song song; mỗi kết quả báo ngay trên thiết bị; tin tổng hợp gửi khi cả đợt xong.
+    async function acquireRound(token, taskObjs) {
+        const round = { id: ++roundSeq, successes: [], failures: [] };
+        const state = S();
+        state.acquiring += taskObjs.length;
+        try {
+            await runLimited(taskObjs, modules.settings.get('acquireConcurrency'), async taskObj => {
+                const info = getTaskInfo(taskObj);
+                try {
+                    const result = await acquireWithRetry(token, taskObj);
+                    if (result.ok) {
+                        state.acquired++;
+                        round.successes.push({ info, result });
+                        silentRetry.delete(info.id);
+                        reattempts.delete(info.id);
+                        modules.monitorState.event('ok', `Đã nhận ${info.id} (${result.elapsedMs} ms)`);
+                        void modules.notifications.notifyAcquireSuccess(info, result);
+                    }
+                    else if (result.kind === "stopped") {
+                        modules.monitorState.event('info', `Huỷ nhận ${info.id} (monitor đã dừng)`);
+                    }
+                    else {
+                        state.acquireFailed++;
+                        // Hết lượt thử vì lỗi tạm thời: cho phép đúng 1 lượt nữa ở poll kế (nếu task còn trong pool).
+                        if (result.gaveUp && (reattempts.get(info.id) || 0) < modules.config.MAX_REATTEMPT_ROUNDS) {
+                            reattempts.set(info.id, (reattempts.get(info.id) || 0) + 1);
+                            seenIds.delete(info.id);
+                            silentRetry.add(info.id);
+                            result.willRetryNextPoll = true;
+                        }
+                        round.failures.push({ info, result });
+                        state.lastError = { at: Date.now(), kind: 'acquire', message: `${info.id}: ${result.kind === 'http' ? 'HTTP ' + result.status : result.message}` };
+                        modules.monitorState.event('error', `Nhận ${info.id} thất bại: ${result.kind === 'http' ? 'HTTP ' + result.status : (result.message || result.kind)}`);
+                        void modules.notifications.notifyAcquireFailure(info, result);
+                    }
+                }
+                catch (error) {
+                    log.error('acquireRound worker lỗi không mong đợi:', error);
+                    modules.monitorState.event('error', `Lỗi nội bộ khi nhận ${info.id}`);
+                }
+            });
+        }
+        finally {
+            state.acquiring = Math.max(0, state.acquiring - taskObjs.length);
+        }
+        void modules.notifications.notifyRoundSummary(round);
+        return round;
+    }
+
+    /* ---------------------------------------------------------------------
+     * POLL
+     * --------------------------------------------------------------------- */
     function extractTasks(body) {
         if (Array.isArray(body))
             return body;
@@ -3925,14 +4302,53 @@ factories.taskMonitor = function createTaskMonitor(modules) {
         return null;
     }
     const seenIds = new Set();
-    let firstPoll = true;
     let timer = null;
     let stopped = false;
     let cycleRunning = false;
+    // Ghi kết quả mỗi lần poll vào monitorState (nguồn dữ liệu cho bảng trạng thái và watchdog).
+    function recordPoll(ok, kind, message, status, startedAt) {
+        const state = S();
+        state.pollCount++;
+        state.lastPollAt = Date.now();
+        state.lastPollMs = Math.round(now() - startedAt);
+        state.lastPollOk = ok;
+        state.lastPollStatus = status ? String(status) : (ok ? '' : kind);
+        if (ok) {
+            if (state.consecutiveFailures >= 3)
+                modules.monitorState.event('ok', `Poll hoạt động lại sau ${state.consecutiveFailures} lần lỗi`);
+            state.pollOkCount++;
+            state.lastSuccessAt = state.lastPollAt;
+            state.consecutiveFailures = 0;
+            state.failureKind = '';
+            state.phase = 'idle';
+        }
+        else {
+            state.consecutiveFailures++;
+            state.failureKind = kind;
+            modules.monitorState.setError(kind, message);
+            if (state.consecutiveFailures === 1 || state.consecutiveFailures === 3)
+                modules.monitorState.event('warn', `Poll lỗi (${kind}${status ? ' ' + status : ''}): ${message}`);
+        }
+    }
+    function trimSeenIds() {
+        // Giữ bộ nhớ có giới hạn: bỏ id cũ nhất (Set giữ thứ tự thêm vào).
+        while (seenIds.size > modules.config.MAX_SEEN_IDS) {
+            seenIds.delete(seenIds.values().next().value);
+        }
+    }
     async function runCycle() {
+        const startedAt = now();
+        const state = S();
+        state.phase = 'polling';
         let candidate = modules.auth.findToken() || modules.auth.findToken(true);
-        if (!candidate)
+        if (!candidate) {
+            state.token = null;
+            state.phase = 'waiting_token';
+            recordPoll(false, 'no_token', 'Không tìm thấy token đăng nhập Tbrain', 0, startedAt);
             return modules.config.TOKEN_RETRY_INTERVAL;
+        }
+        const exp = Number(candidate.payload && candidate.payload.exp);
+        state.token = { source: candidate.source, expiresAt: exp ? exp * 1000 : 0 };
         if (!reworkScanTimer) {
             void scanMyTasksForRework(candidate.token);
             reworkScanTimer = modules.runtime.bgSetTimeout(function reworkLoop() {
@@ -3948,27 +4364,52 @@ factories.taskMonitor = function createTaskMonitor(modules) {
         try {
             response = await fetchPool(candidate.token);
         }
-        catch (_) {
+        catch (error) {
+            if (stopped)
+                return getAdaptivePollInterval();
+            const name = error && error.name ? error.name : 'Error';
+            recordPoll(false, name === 'AbortError' ? 'timeout' : 'network', `${name}: ${error && error.message ? error.message : error}`, 0, startedAt);
             return getAdaptivePollInterval();
         }
         if (response.status === 401 || response.status === 403) {
             modules.auth.rejectedTokens.add(candidate.token);
             modules.auth.cachedTokenCandidate = null;
-            return modules.config.TOKEN_RETRY_INTERVAL;
+            recordPoll(false, 'auth', `Token bị từ chối (HTTP ${response.status}) — có thể đã hết hạn, hãy đăng nhập lại Tbrain`, response.status, startedAt);
+            // Nếu trang đã có token mới thì thử lại gần như ngay; không thì chờ ngắn thay vì mù cả phút.
+            const fresh = modules.auth.findToken(true);
+            return fresh ? 500 : Math.min(modules.config.TOKEN_RETRY_INTERVAL, 15000);
         }
-        if (!response.ok)
+        if (!response.ok) {
+            recordPoll(false, 'http', `HTTP ${response.status}${response.statusText ? ' ' + response.statusText : ''}`, response.status, startedAt);
             return getAdaptivePollInterval();
+        }
         let body;
         try {
             body = await response.json();
         }
         catch (_) {
+            recordPoll(false, 'bad_json', 'Phản hồi pool không phải JSON hợp lệ', response.status, startedAt);
             return getAdaptivePollInterval();
         }
         const tasks = extractTasks(body);
-        if (!tasks)
+        if (!tasks) {
+            recordPoll(false, 'bad_shape', 'Phản hồi pool có cấu trúc không nhận diện được', response.status, startedAt);
             return getAdaptivePollInterval();
-        const excludedL1 = getExcludedL1Values(modules.config.L1_EXCEPT);
+        }
+        recordPoll(true, '', '', response.status, startedAt);
+        state.poolSize = tasks.length;
+        // Dọn các task đang chờ thử lại mà đã biến mất khỏi pool.
+        if (silentRetry.size > 0) {
+            const present = new Set(tasks.map(getTaskId));
+            for (const id of Array.from(silentRetry)) {
+                if (!present.has(id)) {
+                    silentRetry.delete(id);
+                    reattempts.delete(id);
+                }
+            }
+        }
+        const excludedL1 = getExcludedL1Values(modules.settings.get('l1Except'));
+        const minDuration = modules.settings.get('minDurationSeconds');
         const eligibleTasks = [];
         for (const task of tasks) {
             const id = getTaskId(task);
@@ -3977,18 +4418,28 @@ factories.taskMonitor = function createTaskMonitor(modules) {
             if (hasExcludedL1(task, excludedL1))
                 continue;
             const duration = Number(task && task.durationSeconds);
-            if (Number.isFinite(duration) && duration > modules.config.MIN_DURATION_SECONDS) {
+            if (Number.isFinite(duration) && duration > minDuration) {
                 seenIds.add(id);
                 eligibleTasks.push(task);
             }
         }
+        trimSeenIds();
+        state.seen = seenIds.size;
         if (eligibleTasks.length > 0) {
-            // Thông báo + mail NGAY khi phát hiện task (song song, không chặn bước nhận task).
-            void modules.notifications.notifyTasksDetected(eligibleTasks.map(getTaskInfo));
-            if (modules.config.AUTO_ACQUIRE) {
-                await acquireNew(candidate.token, eligibleTasks);
+            const infos = eligibleTasks.map(getTaskInfo);
+            const fresh = infos.filter(info => !silentRetry.has(info.id));
+            state.detected += fresh.length;
+            if (fresh.length > 0) {
+                modules.monitorState.event('info', `Phát hiện ${fresh.length} task: ${fresh.map(i => i.id).join(', ')}`);
+                // Tin phát hiện ngay lập tức, song song với việc nhận task.
+                void modules.notifications.notifyTasksDetected(fresh);
+            }
+            if (modules.settings.get('autoAcquire')) {
+                // Nhận ở nền: poll tiếp tục chạy trong lúc đang thử lại, không bỏ lỡ task mới.
+                void acquireRound(candidate.token, eligibleTasks);
             }
         }
+        perf('runCycle', startedAt);
         return getAdaptivePollInterval();
     }
     const reworkSeen = new Map();
@@ -4057,13 +4508,19 @@ factories.taskMonitor = function createTaskMonitor(modules) {
             fetchHold = true;
             modules.runtime.bgBegin();
         }
+        if (S().monitor !== 'running') {
+            S().monitor = 'running';
+            S().startedAt = Date.now();
+        }
         cycleRunning = true;
         try {
             const delay = await runCycle();
             if (!stopped)
                 timer = modules.runtime.bgSetTimeout(tick, delay);
         }
-        catch (_) {
+        catch (error) {
+            log.error('runCycle lỗi không mong đợi:', error);
+            recordPoll(false, 'exception', error && error.message ? error.message : String(error), 0, now());
             if (!stopped)
                 timer = modules.runtime.bgSetTimeout(tick, getAdaptivePollInterval());
         }
@@ -4073,6 +4530,8 @@ factories.taskMonitor = function createTaskMonitor(modules) {
     }
     function stop() {
         stopped = true;
+        S().monitor = 'off';
+        S().phase = 'idle';
         modules.runtime.bgClearTimeout(timer);
         modules.runtime.bgClearTimeout(reworkScanTimer);
         timer = null;
@@ -4096,8 +4555,140 @@ factories.taskMonitor = function createTaskMonitor(modules) {
         get tick() { return tick; },
         get wake() { return wake; },
         get log() { return log; },
+        get seenCount() { return seenIds.size; },
         get stopped() { return stopped; },
-        set stopped(value) { stopped = value; }
+        set stopped(value) {
+            stopped = !!value;
+            if (stopped)
+                S().monitor = 'off';
+        }
+    };
+};
+
+// MODULE: watchdog
+/**
+ * watchdog
+ * Detects a "silent" monitor and alerts: no successful poll for N minutes, repeated token rejection,
+ * or the tab/timers having been frozen (detected on resume). Alerts go to every channel.
+ * Limit: it runs inside the page, so it cannot speak while the whole tab is frozen; it reports the gap when the tab wakes.
+ * Dependencies: config, monitorState, notifications, runtime, settings.
+ * Module state stays in this closure; cross-module mutable bindings use live accessors.
+ */
+factories.watchdog = function createWatchdog(modules) {
+    'use strict';
+    const MAX_REPEATS = 6; // chặn spam: tối đa số lần nhắc lại cho một đợt chết lặng
+    let timerId = null;
+    let lastTickWall = Date.now();
+    let graceUntil = 0;
+    let stalledSince = 0;
+    const fmtDuration = ms => modules.notifications.fmtDuration(ms);
+    const fmtClock = ms => new Date(ms).toLocaleTimeString();
+
+    // Nguyên nhân dễ hiểu từ trạng thái poll hiện tại.
+    function diagnose() {
+        const s = modules.monitorState.state;
+        const env = `Tab ${document.hidden ? 'đang ẩn' : 'đang hiển thị'}; mạng ${navigator.onLine === false ? 'ĐANG MẤT' : 'bình thường'}.`;
+        let reason;
+        switch (s.failureKind) {
+            case 'no_token': reason = 'Không tìm thấy token đăng nhập. Hãy mở/đăng nhập lại Tbrain trong tab này.'; break;
+            case 'auth': reason = 'Token bị từ chối (401/403) liên tục — phiên đăng nhập có thể đã hết hạn. Hãy tải lại trang hoặc đăng nhập lại.'; break;
+            case 'http': reason = `Server trả lỗi liên tục (${s.lastPollStatus}). Có thể Tbrain đang gặp sự cố hoặc bạn bị rate limit.`; break;
+            case 'network': case 'timeout': reason = 'Lỗi mạng/timeout liên tục khi gọi Tbrain.'; break;
+            case 'bad_json': case 'bad_shape': reason = 'Tbrain trả dữ liệu lạ — API có thể đã đổi.'; break;
+            case 'exception': reason = 'Lỗi nội bộ của tool khi poll (xem console).'; break;
+            default: reason = s.pollCount === 0 || s.lastPollAt === 0
+                ? 'Chưa có lần poll nào chạy — tab có thể bị trình duyệt tạm dừng hoặc timer bị chặn.'
+                : 'Không có lần poll nào hoàn tất — tab có thể bị trình duyệt tạm dừng/throttle.';
+        }
+        return `${reason}\n${env}`;
+    }
+    function describeState(silentMs) {
+        const s = modules.monitorState.state;
+        const lines = [
+            `Đã ${fmtDuration(silentMs)} không poll thành công.`,
+            `Poll thành công gần nhất: ${s.lastSuccessAt ? fmtClock(s.lastSuccessAt) : 'chưa có'}`,
+            `Số lần lỗi liên tiếp: ${s.consecutiveFailures}`
+        ];
+        if (s.lastError) lines.push(`Lỗi gần nhất (${s.lastError.kind}, ${fmtClock(s.lastError.at)}): ${s.lastError.message}`);
+        if (s.token && s.token.expiresAt) lines.push(`Token hết hạn lúc: ${fmtClock(s.token.expiresAt)}${s.token.expiresAt < Date.now() ? ' (ĐÃ HẾT HẠN)' : ''}`);
+        lines.push(`Chẩn đoán: ${diagnose()}`);
+        lines.push('⚠ Trong thời gian này tool có thể đã bỏ lỡ task mới.');
+        return lines.join('\n');
+    }
+    function check() {
+        const s = modules.monitorState.state;
+        const wd = s.watchdog;
+        const wall = Date.now();
+        const elapsed = wall - lastTickWall;
+        lastTickWall = wall;
+        if (!modules.settings.get('watchdogEnabled') || s.monitor !== 'running') {
+            // Tắt cảnh báo hoặc monitor đã dừng: xoá trạng thái, không báo "đã hoạt động lại".
+            wd.alerting = false;
+            stalledSince = 0;
+            return;
+        }
+        // 1) Tab/timer bị đóng băng: timer lẽ ra chạy mỗi WATCHDOG_TICK_MS nhưng cách quãng quá lâu.
+        if (elapsed > modules.config.WATCHDOG_GAP_MS) {
+            wd.lastGapMs = elapsed;
+            wd.lastGapAt = wall;
+            graceUntil = wall + 20000; // cho poll kịp chạy lại trước khi xét "chết lặng"
+            modules.monitorState.event('warn', `Tab bị tạm dừng ~${fmtDuration(elapsed)}`);
+            void modules.notifications.notifyAlert('gap', {
+                short: `Tab bị tạm dừng ~${fmtDuration(elapsed)} (${fmtClock(wall - elapsed)} → ${fmtClock(wall)}). Có thể đã bỏ lỡ task.`,
+                text: `Tab/trình duyệt bị tạm dừng khoảng ${fmtDuration(elapsed)} (từ ${fmtClock(wall - elapsed)} đến ${fmtClock(wall)}).\nTrong lúc đó tool không poll nên có thể đã bỏ lỡ task.\nGợi ý: giữ tab ở foreground, tắt tối ưu pin cho trình duyệt, hoặc dùng cài đặt "không ngủ tab".`
+            });
+            return;
+        }
+        if (wall < graceUntil) return;
+        // 2) Chết lặng: lâu không có poll thành công (hoặc token bị từ chối liên tục).
+        const reference = Math.max(s.lastSuccessAt, s.startedAt);
+        const silentMs = wall - reference;
+        const thresholdMs = modules.settings.get('watchdogSilenceSeconds') * 1000;
+        const authDead = (s.failureKind === 'auth' || s.failureKind === 'no_token') && s.consecutiveFailures >= 3;
+        const stalled = silentMs >= thresholdMs || authDead;
+        if (stalled) {
+            const repeatMs = modules.settings.get('alertRepeatMinutes') * 60000;
+            if (!wd.alerting) {
+                wd.alerting = true;
+                wd.since = wall;
+                wd.lastAlertAt = wall;
+                wd.alertCount = 1;
+                stalledSince = wall;
+                modules.monitorState.event('error', `Cảnh báo: ${fmtDuration(silentMs)} không poll được`);
+                void modules.notifications.notifyAlert('stalled', { short: `${fmtDuration(silentMs)} không poll được. ${diagnose().split('\n')[0]}`, text: describeState(silentMs) });
+            }
+            else if (wall - wd.lastAlertAt >= repeatMs && wd.alertCount < MAX_REPEATS) {
+                wd.lastAlertAt = wall;
+                wd.alertCount++;
+                void modules.notifications.notifyAlert('stalled_repeat', { short: `Vẫn chưa poll được sau ${fmtDuration(silentMs)}.`, text: describeState(silentMs) });
+            }
+        }
+        else if (wd.alerting && s.lastSuccessAt > stalledSince) {
+            const downFor = s.lastSuccessAt - wd.since;
+            wd.alerting = false;
+            modules.monitorState.event('ok', 'Tool đã poll lại bình thường');
+            void modules.notifications.notifyAlert('recovered', {
+                short: 'Poll đã hoạt động trở lại.',
+                text: `Poll đã hoạt động trở lại lúc ${fmtClock(s.lastSuccessAt)}.\nĐợt cảnh báo bắt đầu lúc ${fmtClock(wd.since)} (${fmtDuration(Math.max(0, downFor))} trước khi hồi phục), đã báo ${wd.alertCount} lần.`
+            });
+        }
+    }
+    function loop() {
+        try { check(); }
+        catch (error) { modules.logger.console.warn('[Watchdog] lỗi:', error); }
+        timerId = modules.runtime.bgSetTimeout(loop, modules.config.WATCHDOG_TICK_MS);
+    }
+    let initialized = false;
+    function init() {
+        if (initialized) return;
+        initialized = true;
+        lastTickWall = Date.now();
+        timerId = modules.runtime.bgSetTimeout(loop, modules.config.WATCHDOG_TICK_MS);
+    }
+    return {
+        get init() { return init; },
+        get check() { return check; },
+        get diagnose() { return diagnose; }
     };
 };
 
@@ -4105,23 +4696,13 @@ factories.taskMonitor = function createTaskMonitor(modules) {
 /**
  * controls
  * Fill/fetch/key controls and keyboard shortcuts.
- * Dependencies: config, fill, logger, panel, taskMonitor, timeline.
+ * Dependencies: config, fill, logger, notifications, panel, settings, taskMonitor, timeline.
  * Module state stays in this closure; cross-module mutable bindings use live accessors.
  */
 factories.controls = function createControls(modules) {
     'use strict';
     const PLAYBACK_BOOST_RATE = 16;
     const PLAYBACK_BOOST_FALLBACK_RATES = [12, 10, 8, 6, 4, 3, 2];
-    const FETCH_STORAGE_KEYS = {
-        active: 'tb_fetch_active_state',
-        poll: 'tb_poll_interval_val',
-        duration: 'tb_min_duration_val',
-        l1Except: modules.config.L1_EXCEPT_STORAGE_KEY,
-        token: modules.config.TOKEN_STORAGE_KEY,
-        emailRecipient: 'tb_email_recipient',
-        emailWebAppUrl: modules.config.EMAIL_WEB_APP_URL_STORAGE_KEY,
-        emailWebhookToken: modules.config.EMAIL_WEBHOOK_TOKEN_STORAGE_KEY
-    };
     const RESPONSIVE_STYLE_ID = 'tb-fetch-responsive-style';
     const RESPONSIVE_CSS = `
 #tb-page-tools .tbp-btn,#tb-fetch-control-wrapper .tbp-btn{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:5px;height:31px;min-height:30px;padding:0 10px;border:1px solid transparent;border-radius:7px;background:#334155;color:#e2e8f0;font:600 11px/1 system-ui,-apple-system,"Segoe UI",sans-serif;cursor:pointer;white-space:nowrap;user-select:none;transition:background-color .14s ease,border-color .14s ease,box-shadow .14s ease,transform .14s ease,opacity .14s ease,filter .14s ease}
@@ -4332,9 +4913,7 @@ factories.controls = function createControls(modules) {
             wrapper = document.createElement('div');
             wrapper.id = 'tb-fetch-control-wrapper';
             wrapper.setAttribute('aria-label', 'Fetch Task and API key controls');
-            let isActive = localStorage.getItem(FETCH_STORAGE_KEYS.active) !== null
-                ? JSON.parse(localStorage.getItem(FETCH_STORAGE_KEYS.active))
-                : true;
+            let isActive = modules.settings.get('fetchActive');
             const toggleBtn = document.createElement('button');
             toggleBtn.id = 'tb-fetch-toggle';
             toggleBtn.type = 'button';
@@ -4373,7 +4952,7 @@ factories.controls = function createControls(modules) {
             updateToggleButton();
             toggleBtn.onclick = () => {
                 isActive = !isActive;
-                localStorage.setItem(FETCH_STORAGE_KEYS.active, JSON.stringify(isActive));
+                modules.settings.set('fetchActive', isActive);
                 if (isActive) {
                     modules.taskMonitor.stopped = false;
                     updateToggleButton();
@@ -4401,8 +4980,7 @@ factories.controls = function createControls(modules) {
                 updateNotificationButton(notificationBtn);
             };
             window.getStoredApiKey = function () {
-                const saved = localStorage.getItem(FETCH_STORAGE_KEYS.token);
-                return saved ? JSON.parse(saved) : (typeof modules.config.GROQ_API_KEY !== 'undefined' ? modules.config.GROQ_API_KEY : '');
+                return modules.settings.get('groqApiKey');
             };
             const btnKey = document.createElement('button');
             btnKey.id = 'tb-api-key';
@@ -4436,7 +5014,7 @@ factories.controls = function createControls(modules) {
                 if (saveBtn) {
                     saveBtn.onclick = () => {
                         const newKey = inputEl.value.trim();
-                        localStorage.setItem(FETCH_STORAGE_KEYS.token, JSON.stringify(newKey));
+                        modules.settings.set('groqApiKey', newKey);
                         tokenModal.style.display = 'none';
                     };
                 }
@@ -4472,8 +5050,7 @@ factories.controls = function createControls(modules) {
         const keyButton = document.getElementById('tb-api-key');
         const notificationButton = document.getElementById('tb-enable-notifications');
         let wrapper = document.getElementById('tb-fetch-settings-wrapper');
-        const activeState = localStorage.getItem(FETCH_STORAGE_KEYS.active);
-        const isActive = activeState === null || JSON.parse(activeState);
+        const isActive = modules.settings.get('fetchActive');
         if (wrapper) {
             if (wrapper.parentElement !== controlsWrapper)
                 controlsWrapper.insertBefore(wrapper, notificationButton && notificationButton.parentElement === controlsWrapper
@@ -4484,18 +5061,12 @@ factories.controls = function createControls(modules) {
             wrapper.hidden = !isActive || !settingsToggle || settingsToggle.getAttribute('aria-expanded') !== 'true';
             return;
         }
-        const currentPoll = localStorage.getItem(FETCH_STORAGE_KEYS.poll) !== null
-            ? parseInt(localStorage.getItem(FETCH_STORAGE_KEYS.poll), 10)
-            : modules.config.POLL_INTERVAL;
-        const currentDuration = localStorage.getItem(FETCH_STORAGE_KEYS.duration) !== null
-            ? parseInt(localStorage.getItem(FETCH_STORAGE_KEYS.duration), 10)
-            : modules.config.MIN_DURATION_SECONDS;
-        const currentL1Except = localStorage.getItem(FETCH_STORAGE_KEYS.l1Except) !== null
-            ? localStorage.getItem(FETCH_STORAGE_KEYS.l1Except)
-            : modules.config.DEFAULT_L1_EXCEPT;
-        modules.config.POLL_INTERVAL = currentPoll;
-        modules.config.MIN_DURATION_SECONDS = currentDuration;
-        modules.config.L1_EXCEPT = currentL1Except;
+        const inputs = new Map();
+        const LEGACY_IDS = {
+            pollIntervalMs: 'tb-fetch-poll-interval', minDurationSeconds: 'tb-fetch-min-duration', l1Except: 'tb-fetch-l1-except',
+            emailRecipient: 'tb-fetch-email-recipient', emailWebAppUrl: 'tb-fetch-email-endpoint', emailWebhookToken: 'tb-fetch-email-secret'
+        };
+        ensureSettingsStyles();
         wrapper = document.createElement('div');
         wrapper.id = 'tb-fetch-settings-wrapper';
         wrapper.className = 'tbp-fetch-settings-popover';
@@ -4505,127 +5076,179 @@ factories.controls = function createControls(modules) {
         const heading = document.createElement('div');
         heading.id = 'tb-fetch-settings-title';
         heading.className = 'tbp-fetch-settings-heading';
-        heading.textContent = 'Fetch Task settings';
+        heading.textContent = `Cài đặt (v${modules.config.VERSION})`;
         wrapper.setAttribute('aria-labelledby', heading.id);
         wrapper.appendChild(heading);
-        const pollInput = document.createElement('input');
-        pollInput.id = 'tb-fetch-poll-interval';
-        pollInput.className = 'tbp-control-input';
-        pollInput.type = 'number';
-        pollInput.value = currentPoll;
-        pollInput.min = '500';
-        pollInput.title = 'Poll interval (ms)';
-        pollInput.setAttribute('aria-label', 'Poll interval (ms)');
-        pollInput.onchange = event => {
-            const value = parseInt(event.target.value, 10);
-            if (value >= 500) {
-                modules.config.POLL_INTERVAL = value;
-                localStorage.setItem(FETCH_STORAGE_KEYS.poll, value);
+        const message = document.createElement('div');
+        message.id = 'tb-set-msg';
+        message.className = 'tbp-set-msg';
+        message.setAttribute('role', 'status');
+        const showMessage = (text, kind) => {
+            message.textContent = text;
+            message.className = 'tbp-set-msg' + (kind ? ' tbp-set-' + kind : '');
+        };
+        const refreshInputs = () => {
+            for (const [name, input] of inputs) {
+                const value = modules.settings.get(name);
+                if (input.type === 'checkbox') input.checked = !!value;
+                else input.value = value;
             }
         };
-        const durationInput = document.createElement('input');
-        durationInput.id = 'tb-fetch-min-duration';
-        durationInput.className = 'tbp-control-input';
-        durationInput.type = 'number';
-        durationInput.value = currentDuration;
-        durationInput.min = '0';
-        durationInput.title = 'Thời lượng task tối thiểu (giây)';
-        durationInput.setAttribute('aria-label', 'Thời lượng task tối thiểu (giây)');
-        durationInput.onchange = event => {
-            const value = parseInt(event.target.value, 10);
-            if (value >= 0) {
-                modules.config.MIN_DURATION_SECONDS = value;
-                localStorage.setItem(FETCH_STORAGE_KEYS.duration, value);
+        // Mọi ô nhập được sinh từ schema của module settings: thêm cài đặt mới chỉ cần sửa một chỗ.
+        const schema = modules.settings.SCHEMA;
+        let currentSection = null;
+        for (const name of modules.settings.names()) {
+            const def = schema[name];
+            if (!def.input || def.transient || name === 'groqApiKey')
+                continue;
+            if (def.section !== currentSection) {
+                currentSection = def.section;
+                const title = document.createElement('div');
+                title.className = 'tbp-set-section';
+                title.textContent = modules.settings.SECTION_TITLES[def.section] || def.section;
+                wrapper.appendChild(title);
             }
-        };
-        const l1ExceptInput = document.createElement('input');
-        l1ExceptInput.id = 'tb-fetch-l1-except';
-        l1ExceptInput.className = 'tbp-control-input';
-        l1ExceptInput.type = 'text';
-        l1ExceptInput.value = currentL1Except;
-        l1ExceptInput.placeholder = 'Automotive and Transport, ...';
-        l1ExceptInput.title = 'L1 cần bỏ qua, phân cách bằng dấu phẩy';
-        l1ExceptInput.setAttribute('aria-label', 'L1 Except');
-        l1ExceptInput.onchange = event => {
-            const value = String(event.target.value || '');
-            modules.config.L1_EXCEPT = value;
-            localStorage.setItem(FETCH_STORAGE_KEYS.l1Except, value);
-        };
-        const emailInput = document.createElement('input');
-        emailInput.id = 'tb-fetch-email-recipient';
-        emailInput.className = 'tbp-control-input';
-        emailInput.type = 'email';
-        emailInput.placeholder = 'name@example.com';
-        emailInput.value = localStorage.getItem(FETCH_STORAGE_KEYS.emailRecipient) || '';
-        emailInput.title = 'Email nhận thông báo';
-        emailInput.setAttribute('aria-label', 'Email nhận thông báo');
-        emailInput.onchange = event => localStorage.setItem(FETCH_STORAGE_KEYS.emailRecipient, String(event.target.value || '').trim());
-
-        const emailEndpointInput = document.createElement('input');
-        emailEndpointInput.id = 'tb-fetch-email-endpoint';
-        emailEndpointInput.className = 'tbp-control-input';
-        emailEndpointInput.type = 'url';
-        emailEndpointInput.placeholder = 'https://script.google.com/macros/s/.../exec';
-        emailEndpointInput.value = localStorage.getItem(FETCH_STORAGE_KEYS.emailWebAppUrl) || '';
-        emailEndpointInput.title = 'Google Apps Script Web App URL của tài khoản bạn';
-        emailEndpointInput.setAttribute('aria-label', 'Google Apps Script Web App URL');
-        emailEndpointInput.onchange = event => localStorage.setItem(FETCH_STORAGE_KEYS.emailWebAppUrl, String(event.target.value || '').trim());
-
-        const emailSecretInput = document.createElement('input');
-        emailSecretInput.id = 'tb-fetch-email-secret';
-        emailSecretInput.className = 'tbp-control-input';
-        emailSecretInput.type = 'password';
-        emailSecretInput.autocomplete = 'new-password';
-        emailSecretInput.placeholder = 'Nhập secret riêng của bạn';
-        emailSecretInput.value = localStorage.getItem(FETCH_STORAGE_KEYS.emailWebhookToken) || '';
-        emailSecretInput.title = 'Webhook secret phải trùng với WEBHOOK_TOKEN trong Apps Script';
-        emailSecretInput.setAttribute('aria-label', 'Webhook secret');
-        emailSecretInput.onchange = event => localStorage.setItem(FETCH_STORAGE_KEYS.emailWebhookToken, String(event.target.value || '').trim());
-
-        const appendField = (labelText, input) => {
+            const input = document.createElement('input');
+            input.id = LEGACY_IDS[name] || ('tb-set-' + name);
+            input.type = def.input;
+            input.setAttribute('aria-label', def.label);
+            if (def.input === 'checkbox') {
+                input.checked = !!modules.settings.get(name);
+                input.onchange = () => modules.settings.set(name, input.checked);
+            }
+            else {
+                input.className = 'tbp-control-input';
+                input.value = modules.settings.get(name);
+                if (def.placeholder) input.placeholder = def.placeholder;
+                if (def.min !== undefined) input.min = String(def.min);
+                if (def.max !== undefined) input.max = String(def.max);
+                if (def.input === 'password') input.autocomplete = 'new-password';
+                if (def.hint) input.title = def.hint;
+                input.onchange = () => {
+                    const result = modules.settings.set(name, input.value);
+                    if (result.ok) {
+                        input.value = result.value;
+                        showMessage('');
+                    }
+                    else {
+                        showMessage(`${def.label}: ${result.error}`, 'bad');
+                        input.value = modules.settings.get(name);
+                    }
+                };
+            }
+            inputs.set(name, input);
             const field = document.createElement('label');
-            field.className = 'tbp-fetch-settings-field';
+            field.className = 'tbp-fetch-settings-field' + (def.input === 'checkbox' ? ' tbp-set-check' : '');
             field.setAttribute('for', input.id);
             const label = document.createElement('span');
             label.className = 'tbp-fetch-setting-label';
-            label.textContent = labelText;
-            field.appendChild(label);
-            field.appendChild(input);
+            label.textContent = def.label;
+            if (def.input === 'checkbox') { field.appendChild(input); field.appendChild(label); }
+            else { field.appendChild(label); field.appendChild(input); }
             wrapper.appendChild(field);
+            if (def.hint && def.input !== 'text') {
+                const note = document.createElement('div');
+                note.className = 'tbp-fetch-settings-hint';
+                note.textContent = def.hint;
+                wrapper.appendChild(note);
+            }
+        }
+        const makeButton = (text, title, onclick) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'tbp-btn tbp-btn-neutral';
+            button.textContent = text;
+            button.title = title;
+            button.onclick = onclick;
+            return button;
         };
-        appendField('Poll interval (ms)', pollInput);
-        appendField('Thời lượng tối thiểu (giây)', durationInput);
-        appendField('L1 Except', l1ExceptInput);
-
-        // Email configuration stays inside the single Fetch Task settings panel.
-        // Two rows: recipient address, then Web App URL + per-user secret side by side.
-        appendField('Email nhận thông báo', emailInput);
-        const emailServiceRow = document.createElement('div');
-        emailServiceRow.className = 'tbp-fetch-email-config-row';
-        const appendCompactEmailField = (labelText, input) => {
-            const field = document.createElement('label');
-            field.className = 'tbp-fetch-settings-field tbp-fetch-email-compact-field';
-            field.setAttribute('for', input.id);
-            const label = document.createElement('span');
-            label.className = 'tbp-fetch-setting-label';
-            label.textContent = labelText;
-            field.appendChild(label);
-            field.appendChild(input);
-            emailServiceRow.appendChild(field);
+        const testChannel = async channel => {
+            showMessage(`Đang gửi thử ${channel}...`);
+            const outcome = await modules.notifications.sendTest(channel);
+            if (outcome.ok) showMessage(`✓ Gửi thử ${channel} thành công`, 'ok');
+            else showMessage(`✗ ${channel}: ${outcome.reason || 'lỗi'}`, 'bad');
         };
-        appendCompactEmailField('Apps Script URL', emailEndpointInput);
-        appendCompactEmailField('Webhook Secret', emailSecretInput);
-        wrapper.appendChild(emailServiceRow);
-
+        const testRow = document.createElement('div');
+        testRow.className = 'tbp-set-actions';
+        testRow.appendChild(makeButton('✉ Gửi thử Email', 'Gửi một email thử bằng cấu hình hiện tại', () => testChannel('email')));
+        testRow.appendChild(makeButton('✈ Gửi thử Telegram', 'Gửi một tin Telegram thử bằng cấu hình hiện tại', () => testChannel('telegram')));
+        wrapper.appendChild(testRow);
+        // ---- Xuất / nhập / đặt lại ----
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = 'application/json,.json';
+        fileInput.hidden = true;
+        fileInput.onchange = async () => {
+            const file = fileInput.files && fileInput.files[0];
+            fileInput.value = '';
+            if (!file) return;
+            try {
+                const text = await file.text();
+                const report = modules.settings.importJson(text);
+                refreshInputs();
+                const parts = [`Đã áp dụng ${report.applied.length} cài đặt`];
+                if (report.workingTime) parts.push(`${report.workingTime} cấu hình giờ làm việc`);
+                if (report.skipped.length) parts.push(`bỏ qua ${report.skipped.length} (${report.skipped.map(s => s.name + ': ' + s.reason).join('; ')})`);
+                if (report.unknown.length) parts.push(`không nhận diện ${report.unknown.length}`);
+                showMessage(parts.join(' · '), report.skipped.length ? 'warn' : 'ok');
+            }
+            catch (error) {
+                showMessage('Nhập thất bại: ' + (error && error.message ? error.message : error), 'bad');
+            }
+        };
+        const exportSettings = () => {
+            const includeSecrets = confirm('Xuất cả các khóa bí mật (Groq API key, Webhook Secret, Telegram Bot Token)?\n\nOK = có (chỉ lưu file ở nơi an toàn)\nHủy = không (file sẽ không chứa khóa bí mật)');
+            const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 13);
+            const blob = new Blob([modules.settings.exportJson({ includeSecrets })], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `tbrain-settings-${stamp}.json`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 2000);
+            showMessage(includeSecrets ? 'Đã xuất cài đặt (CÓ khóa bí mật)' : 'Đã xuất cài đặt (không có khóa bí mật)', includeSecrets ? 'warn' : 'ok');
+        };
+        const resetSettings = () => {
+            if (!confirm('Đặt lại toàn bộ cài đặt về mặc định? (Các khóa bí mật được giữ nguyên.)')) return;
+            modules.settings.resetAll();
+            refreshInputs();
+            showMessage('Đã đặt lại cài đặt về mặc định', 'ok');
+        };
+        const dataRow = document.createElement('div');
+        dataRow.className = 'tbp-set-actions';
+        dataRow.appendChild(makeButton('⬇ Xuất', 'Lưu cài đặt ra file JSON', exportSettings));
+        dataRow.appendChild(makeButton('⬆ Nhập', 'Nạp cài đặt từ file JSON đã xuất', () => fileInput.click()));
+        dataRow.appendChild(makeButton('↺ Đặt lại', 'Đưa cài đặt về mặc định', resetSettings));
+        dataRow.appendChild(fileInput);
+        wrapper.appendChild(dataRow);
+        wrapper.appendChild(message);
         const hint = document.createElement('div');
         hint.className = 'tbp-fetch-settings-hint';
-        hint.textContent = 'Email dùng chung công tắc Fetch Task. Nhập email, Web App URL và Webhook Secret của chính bạn; để trống một trong các trường thì không gửi email. Các cấu hình được lưu riêng trong trình duyệt, không nằm trong mã nguồn Git.';
+        hint.textContent = 'Tất cả cài đặt lưu cục bộ trong trình duyệt, không nằm trong mã nguồn. Telegram: tạo bot qua @BotFather, nhắn bot một tin rồi lấy Chat ID. Để trống thông tin kênh nào thì kênh đó không gửi.';
         wrapper.appendChild(hint);
         if (settingsToggle)
             settingsToggle.style.display = isActive ? '' : 'none';
         controlsWrapper.insertBefore(wrapper, notificationButton && notificationButton.parentElement === controlsWrapper
             ? notificationButton
             : keyButton && keyButton.parentElement === controlsWrapper ? keyButton : null);
+    }
+    const SETTINGS_STYLE_ID = 'tb-settings-extra-style';
+    function ensureSettingsStyles() {
+        if (document.getElementById(SETTINGS_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = SETTINGS_STYLE_ID;
+        style.textContent = `
+#tb-fetch-settings-wrapper{max-height:70vh;overflow:auto}
+#tb-fetch-settings-wrapper .tbp-set-section{margin-top:8px;padding-top:6px;border-top:1px solid #334155;color:#a5b4fc;font-size:11px;font-weight:700}
+#tb-fetch-settings-wrapper .tbp-set-check{flex-direction:row;align-items:center;gap:8px}
+#tb-fetch-settings-wrapper .tbp-set-check input{width:16px;height:16px;margin:0}
+#tb-fetch-settings-wrapper .tbp-set-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+#tb-fetch-settings-wrapper .tbp-set-msg{min-height:14px;margin-top:6px;font-size:11px;color:#94a3b8;word-break:break-word}
+#tb-fetch-settings-wrapper .tbp-set-ok{color:#4ade80}#tb-fetch-settings-wrapper .tbp-set-warn{color:#fbbf24}#tb-fetch-settings-wrapper .tbp-set-bad{color:#f87171}
+`;
+        (document.head || document.documentElement).appendChild(style);
     }
     /* ---------------------------------------------------------------------
      * UI INJECTION - GẮN ĐIỀU KHIỂN VÀO HEADER TASK ĐANG LÀM
@@ -7947,6 +8570,156 @@ factories.passExamples = function createPassExamples(modules) {
     };
 };
 
+// MODULE: monitorStatusView
+/**
+ * monitorStatusView
+ * Small status pill in the Fetch Task header controls; click it for a detail popover
+ * (poll health, counters, last error, token, channels, watchdog, recent events).
+ * Read-only: it only displays monitorState. Mounted/refreshed by bootstrap.
+ * Dependencies: monitorState, notifications, taskMonitor.
+ * Module state stays in this closure; cross-module mutable bindings use live accessors.
+ */
+factories.monitorStatusView = function createMonitorStatusView(modules) {
+    'use strict';
+    const STYLE_ID = 'tb-monitor-status-style';
+    const ROOT_ID = 'tb-monitor-status';
+    const CSS = `
+#tb-monitor-status{position:relative;display:inline-flex;align-items:center}
+#tb-monitor-status .tbms-pill{box-sizing:border-box;display:inline-flex;align-items:center;gap:6px;height:31px;padding:0 10px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font:600 12px/1 system-ui,sans-serif;cursor:pointer;white-space:nowrap}
+#tb-monitor-status .tbms-pill:hover{border-color:#6366f1}
+#tb-monitor-status .tbms-pop{position:absolute;top:calc(100% + 6px);right:0;z-index:2147483000;width:360px;max-width:92vw;max-height:70vh;overflow:auto;padding:10px 12px;border-radius:10px;border:1px solid #334155;background:#0b1220;color:#e2e8f0;font:12px/1.45 system-ui,sans-serif;box-shadow:0 12px 32px rgba(0,0,0,.5)}
+#tb-monitor-status .tbms-pop[hidden]{display:none}
+#tb-monitor-status .tbms-row{display:flex;justify-content:space-between;gap:10px;padding:2px 0;border-bottom:1px dashed #1e293b}
+#tb-monitor-status .tbms-k{color:#94a3b8;flex:0 0 auto}
+#tb-monitor-status .tbms-v{text-align:right;word-break:break-word}
+#tb-monitor-status .tbms-h{margin:8px 0 3px;color:#a5b4fc;font-weight:700}
+#tb-monitor-status .tbms-ev{padding:1px 0;color:#cbd5e1}
+#tb-monitor-status .tbms-ok{color:#4ade80}#tb-monitor-status .tbms-warn{color:#fbbf24}#tb-monitor-status .tbms-bad{color:#f87171}#tb-monitor-status .tbms-dim{color:#64748b}
+`;
+    function ensureStyle() {
+        if (document.getElementById(STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = STYLE_ID;
+        style.textContent = CSS;
+        (document.head || document.documentElement).appendChild(style);
+    }
+    const ago = ms => {
+        if (!ms) return 'chưa có';
+        const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+        if (s < 90) return `${s}s trước`;
+        const m = Math.round(s / 60);
+        return m < 90 ? `${m} phút trước` : `${Math.floor(m / 60)}g${m % 60}p trước`;
+    };
+    const esc = text => String(text == null ? '' : text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const row = (k, v, cls) => `<div class="tbms-row"><span class="tbms-k">${esc(k)}</span><span class="tbms-v ${cls || ''}">${v}</span></div>`;
+
+    // Mức độ sức khoẻ: off | ok | warn | bad
+    function health(s) {
+        if (s.monitor !== 'running') return 'off';
+        if (s.watchdog.alerting) return 'bad';
+        if (s.consecutiveFailures >= 3) return 'bad';
+        if (s.consecutiveFailures > 0 || s.phase === 'rate_limited') return 'warn';
+        return 'ok';
+    }
+    function pillText(s, level) {
+        if (level === 'off') return '⚫ Monitor OFF';
+        const dot = { ok: '🟢', warn: '🟡', bad: '🔴' }[level];
+        if (s.watchdog.alerting) return `${dot} Không poll được · ${modules.notifications.fmtDuration(Date.now() - Math.max(s.lastSuccessAt, s.startedAt))}`;
+        if (s.consecutiveFailures > 0) return `${dot} Lỗi poll ×${s.consecutiveFailures} · ${s.failureKind}`;
+        if (s.phase === 'rate_limited') return `${dot} Đang chờ rate limit`;
+        const acq = s.acquiring > 0 ? ` · đang nhận ${s.acquiring}` : '';
+        return `${dot} ${s.lastSuccessAt ? ago(s.lastSuccessAt) : 'đang poll...'} · ${s.seen} task${acq}`;
+    }
+    function channelRow(name, label, info, status) {
+        if (!status.configured) return row(label, 'chưa cấu hình', 'tbms-dim');
+        if (!status.enabled) return row(label, 'đã tắt', 'tbms-dim');
+        if (!info.lastAt) return row(label, 'sẵn sàng (chưa gửi)', 'tbms-dim');
+        return row(label, info.ok ? `✓ ${ago(info.lastAt)}` : `✗ ${esc(info.error)} (${ago(info.lastAt)})`, info.ok ? 'tbms-ok' : 'tbms-bad');
+    }
+    function detailHtml(s) {
+        const level = health(s);
+        const status = modules.notifications.getChannelStatus();
+        const phaseText = { idle: 'chờ poll kế', polling: 'đang poll', waiting_token: 'chờ token', rate_limited: 'chờ rate limit' }[s.phase] || s.phase;
+        const parts = [];
+        parts.push(row('Trạng thái', s.monitor === 'running' ? `ON · ${esc(phaseText)}` : 'OFF', level === 'bad' ? 'tbms-bad' : level === 'warn' ? 'tbms-warn' : level === 'ok' ? 'tbms-ok' : 'tbms-dim'));
+        parts.push(row('Poll gần nhất', s.lastPollAt ? `${ago(s.lastPollAt)} · ${s.lastPollOk ? 'OK' : 'LỖI'}${s.lastPollStatus ? ' ' + esc(s.lastPollStatus) : ''} · ${s.lastPollMs} ms` : 'chưa có', s.lastPollOk === false ? 'tbms-bad' : ''));
+        parts.push(row('Poll thành công gần nhất', ago(s.lastSuccessAt)));
+        parts.push(row('Tổng poll', `${s.pollOkCount}/${s.pollCount} OK${s.consecutiveFailures ? ` · lỗi liên tiếp ${s.consecutiveFailures}` : ''}`, s.consecutiveFailures ? 'tbms-warn' : ''));
+        parts.push(row('Task trong pool (lần cuối)', s.poolSize));
+        parts.push(row('Task đã thấy', s.seen));
+        parts.push(row('Phát hiện / Nhận OK / Thất bại', `${s.detected} / <span class="tbms-ok">${s.acquired}</span> / <span class="${s.acquireFailed ? 'tbms-bad' : ''}">${s.acquireFailed}</span>`));
+        if (s.acquiring) parts.push(row('Đang nhận', s.acquiring, 'tbms-warn'));
+        parts.push(row('Lỗi gần nhất', s.lastError ? `${esc(s.lastError.kind)}: ${esc(s.lastError.message)} <span class="tbms-dim">(${ago(s.lastError.at)})</span>` : 'không có', s.lastError ? 'tbms-warn' : 'tbms-dim'));
+        if (s.token) {
+            const left = s.token.expiresAt ? s.token.expiresAt - Date.now() : 0;
+            parts.push(row('Token', s.token.expiresAt ? (left > 0 ? `còn ${modules.notifications.fmtDuration(left)}` : 'ĐÃ HẾT HẠN') : 'không rõ hạn', left > 0 || !s.token.expiresAt ? '' : 'tbms-bad'));
+        }
+        else if (s.monitor === 'running') {
+            parts.push(row('Token', 'không tìm thấy', 'tbms-bad'));
+        }
+        parts.push(row('Watchdog', s.watchdog.alerting ? `ĐANG CẢNH BÁO từ ${new Date(s.watchdog.since).toLocaleTimeString()}` : 'bình thường', s.watchdog.alerting ? 'tbms-bad' : 'tbms-ok'));
+        if (s.watchdog.lastGapAt) parts.push(row('Lần tab tạm dừng gần nhất', `${modules.notifications.fmtDuration(s.watchdog.lastGapMs)} (${ago(s.watchdog.lastGapAt)})`, 'tbms-warn'));
+        parts.push('<div class="tbms-h">Kênh nhận tin</div>');
+        parts.push(channelRow('email', 'Email', s.channels.email, status.email));
+        parts.push(channelRow('telegram', 'Telegram', s.channels.telegram, status.telegram));
+        parts.push('<div class="tbms-h">Sự kiện gần đây</div>');
+        if (!s.events.length) parts.push('<div class="tbms-ev tbms-dim">Chưa có sự kiện.</div>');
+        for (const e of s.events.slice(0, 10)) {
+            const cls = { ok: 'tbms-ok', warn: 'tbms-warn', error: 'tbms-bad' }[e.level] || '';
+            parts.push(`<div class="tbms-ev"><span class="tbms-dim">${new Date(e.at).toLocaleTimeString()}</span> <span class="${cls}">${esc(e.text)}</span></div>`);
+        }
+        return parts.join('');
+    }
+    function render() {
+        const root = document.getElementById(ROOT_ID);
+        if (!root) return;
+        const s = modules.monitorState.state;
+        const level = health(s);
+        root.querySelector('.tbms-pill').textContent = pillText(s, level);
+        const pop = root.querySelector('.tbms-pop');
+        if (!pop.hidden) {
+            const top = pop.scrollTop; // giữ vị trí cuộn khi làm mới mỗi giây
+            pop.innerHTML = detailHtml(s);
+            pop.scrollTop = top;
+        }
+    }
+    function mount() {
+        const wrapper = document.getElementById('tb-fetch-control-wrapper');
+        if (!wrapper) return;
+        ensureStyle();
+        let root = document.getElementById(ROOT_ID);
+        if (!root) {
+            root = document.createElement('span');
+            root.id = ROOT_ID;
+            const pill = document.createElement('button');
+            pill.type = 'button';
+            pill.className = 'tbms-pill';
+            pill.setAttribute('aria-label', 'Trạng thái monitor');
+            pill.title = 'Bấm để xem chi tiết trạng thái monitor';
+            const pop = document.createElement('div');
+            pop.className = 'tbms-pop';
+            pop.hidden = true;
+            pill.onclick = event => {
+                event.stopPropagation();
+                pop.hidden = !pop.hidden;
+                render();
+            };
+            pop.onclick = event => event.stopPropagation();
+            document.addEventListener('click', () => { pop.hidden = true; });
+            root.appendChild(pill);
+            root.appendChild(pop);
+        }
+        const toggle = document.getElementById('tb-fetch-toggle');
+        if (root.parentElement !== wrapper)
+            wrapper.insertBefore(root, toggle && toggle.parentElement === wrapper ? toggle.nextSibling : wrapper.firstChild);
+        render();
+    }
+    return {
+        get mount() { return mount; },
+        get render() { return render; }
+    };
+};
+
 // MODULE: bootstrap
 /** Single startup boundary. No business logic belongs here. */
 factories.bootstrap = function createBootstrap(modules) {
@@ -7965,16 +8738,17 @@ factories.bootstrap = function createBootstrap(modules) {
     function start() {
         if (started) return;
         started = true;
-        // Mount controls first so persisted polling/duration settings are restored.
         refresh('panel', modules.panel.ensurePanel, 1000);
         refresh('report-hours', modules.earnings.ensureMyReportWorkingHoursCard, 1000);
         refresh('controls', modules.controls.injectUIControls, 500);
+        refresh('monitor-status', modules.monitorStatusView.mount, 1000);
         modules.storage.loadCaches().catch(error => modules.logger.console.warn('[Cache]', error.message));
         // Do not restart polling when the user previously switched Fetch off.
-        modules.taskMonitor.stopped = modules.storage.storageGet('tb_fetch_active_state') === false;
+        modules.taskMonitor.stopped = !modules.settings.get('fetchActive');
         if (!modules.taskMonitor.stopped) modules.taskMonitor.tick();
         modules.earnings.start();
         void modules.notifications.ensurePermission();
+        modules.watchdog.init();
         modules.logger.console.log('tbrain_tool_for_labeler ready.' +
             (modules.runtime.bgTimer.usingWorker
                 ? ' Worker timers ON (background execution remains best-effort).'
@@ -7986,6 +8760,8 @@ factories.bootstrap = function createBootstrap(modules) {
     const modules = Object.create(null);
     modules.environment = factories.environment(modules);
     modules.config = factories.config(modules);
+    modules.settings = factories.settings(modules);
+    modules.monitorState = factories.monitorState(modules);
     modules.logger = factories.logger(modules);
     modules.panel = factories.panel(modules);
     modules.runtime = factories.runtime(modules);
@@ -7999,7 +8775,9 @@ factories.bootstrap = function createBootstrap(modules) {
     modules.auth = factories.auth(modules);
     modules.notifications = factories.notifications(modules);
     modules.taskMonitor = factories.taskMonitor(modules);
+    modules.watchdog = factories.watchdog(modules);
     modules.controls = factories.controls(modules);
+    modules.monitorStatusView = factories.monitorStatusView(modules);
     modules.earnings = factories.earnings(modules);
     modules.workingTime = factories.workingTime(modules);
     modules.passExamples = factories.passExamples(modules);
@@ -8013,5 +8791,6 @@ factories.bootstrap = function createBootstrap(modules) {
     modules.workingTime.init();
     modules.controls.init();
     modules.passExamples.init();
+    modules.settings.init();
     modules.bootstrap.start();
 })();
