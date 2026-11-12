@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tbrain_tool_for_labeler
 // @namespace    tbrain-master
-// @version      25.0.0
+// @version      25.0.1
 // @description  Groq AI auto-fill + Auto-fetch (parallel acquire, bounded retries) + status panel + watchdog + email/Telegram alerts + central settings
 // @match        https://*.tbrain.ai/*
 // @run-at       document-start
@@ -3795,18 +3795,44 @@ factories.notifications = function createNotifications(modules) {
         if (!outcome.ok) modules.monitorState.event('warn', `Gửi ${name} lỗi: ${outcome.reason}`);
     }
     function httpPostJson(url, payload, timeoutMs) {
-        const gmRequest = gmRequestFn();
-        if (!gmRequest) return Promise.resolve({ status: 0, error: 'Không có GM_xmlhttpRequest' });
-        return new Promise(resolve => {
-            try {
-                gmRequest({
-                    method: 'POST', url, data: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }, timeout: timeoutMs,
-                    onload: response => resolve({ status: response.status, text: response.responseText || '' }),
-                    onerror: () => resolve({ status: 0, error: 'lỗi mạng' }),
-                    ontimeout: () => resolve({ status: 0, error: 'timeout' })
+        return new Promise(async (resolve) => {
+            const gmRequest = gmRequestFn();
+            // 1. Thử dùng GM_xmlhttpRequest nếu có sẵn
+            if (gmRequest) {
+                const gmResult = await new Promise(res => {
+                    try {
+                        gmRequest({
+                            method: 'POST', url, data: JSON.stringify(payload), 
+                            headers: { 'Content-Type': 'application/json' }, timeout: timeoutMs,
+                            onload: response => res({ ok: true, status: response.status, text: response.responseText || '' }),
+                            onerror: () => res({ ok: false }),
+                            ontimeout: () => res({ ok: false })
+                        });
+                    } catch (_) { 
+                        res({ ok: false }); 
+                    }
                 });
+                if (gmResult.ok) {
+                    return resolve({ status: gmResult.status, text: gmResult.text });
+                }
             }
-            catch (error) { resolve({ status: 0, error: String(error && error.message || error) }); }
+            // 2. Fallback sang fetch nếu GM_xmlhttpRequest không tồn tại hoặc chạy thất bại
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), timeoutMs || 15000);               
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal
+                });               
+                clearTimeout(timeout);
+                const text = await response.text();
+                return resolve({ status: response.status, text });
+            } catch (error) {
+                const errKind = error && error.name === 'AbortError' ? 'timeout' : (error && error.message ? error.message : 'lỗi mạng');
+                return resolve({ status: 0, error: errKind });
+            }
         });
     }
     function channelConfig() {
