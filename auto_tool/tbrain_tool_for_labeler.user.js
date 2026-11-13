@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         tbrain_tool_for_labeler
 // @namespace    tbrain-master
-// @version      25.1.0
+// @version      25.2.1
 // @description  Groq AI auto-fill + Auto-fetch (parallel acquire, bounded retries) + status panel + watchdog + keep-awake (silent audio, wake lock) + email/Telegram alerts + central settings
 // @match        https://*.tbrain.ai/*
 // @run-at       document-start
@@ -50,7 +50,7 @@ factories.config = function createConfig(modules) {
      * ===================================================================== */
     // ==================== CONFIG: GROQ API ====================
     const GROQ_API_KEY = "";
-    const VERSION = '25.1.0';
+    const VERSION = '25.2.1';
     const PROJECT_ID = "cfbe006a-9012-41bc-ba3c-afa8a3338139";
     const TOKEN_RETRY_INTERVAL = 60000;
     const API_BASE = "https://api.tbrain.ai";
@@ -99,6 +99,10 @@ factories.config = function createConfig(modules) {
     const SKILL_NAMES = SKILL_GROUPS.map(s => s[0]);
     const DEFAULT_SKILL = SKILL_NAMES[0];
     const DIFFICULTIES = ['Easy', 'Medium', 'Hard'];
+    const SETTING_OPTIONS = ['Indoor', 'Outdoor'];
+    const REAL_WORK_OPTIONS = ['Yes', 'No — staged'];
+    const DEFAULT_SETTING = SETTING_OPTIONS[0];
+    const DEFAULT_REAL_WORK = REAL_WORK_OPTIONS[0];
     const PROMPT_RULES = [
         'You label short first-person video segments of manual hand work for a dataset.',
         'Return ONLY raw JSON: no markdown, no code fences, no comments, no text before or after the JSON.',
@@ -128,7 +132,13 @@ factories.config = function createConfig(modules) {
         '   - Easy: 1-2 simple, repetitive actions with light everyday objects; little precision; no tool or only a trivial one.',
         '   - Medium: several sequential steps, OR moderate precision, OR ordinary tool use (knife, screwdriver, iron), OR deformable objects (cloth, bags, dough).',
         '   - Hard: fine precision or dexterity (threading, soldering, small parts), skilled or powered tool use, heavy/awkward objects,',
-        '     or long multi-step procedures with many object interactions.'
+        '     or long multi-step procedures with many object interactions.',
+        '5. "setting": exactly "Indoor" or "Outdoor".',
+        '   - Indoor: work happens inside a building, room, workshop, kitchen, factory, vehicle cabin, tent or any enclosed space.',
+        '   - Outdoor: work happens outside under open sky or in a clearly open-air space (yard, street, garden, construction site outdoors).',
+        '   - Prefer visual evidence from frames when images are provided (walls/ceiling/indoor lighting vs sky/trees/open air).',
+        '   - If only text is available, infer from scene/environment context and object names; if still ambiguous, use "Indoor".',
+        '   - Do not use other values.'
     ].join('\n');
     // ==================== CONFIG: AUTO-FILL ====================
     const CONFIG = {
@@ -215,6 +225,10 @@ factories.config = function createConfig(modules) {
     return {
         get SKILL_NAMES() { return SKILL_NAMES; },
         get DIFFICULTIES() { return DIFFICULTIES; },
+        get SETTING_OPTIONS() { return SETTING_OPTIONS; },
+        get REAL_WORK_OPTIONS() { return REAL_WORK_OPTIONS; },
+        get DEFAULT_SETTING() { return DEFAULT_SETTING; },
+        get DEFAULT_REAL_WORK() { return DEFAULT_REAL_WORK; },
         get PROJECT_ID() { return PROJECT_ID; },
         get VERSION() { return VERSION; },
         get GROQ() { return GROQ; },
@@ -1467,15 +1481,16 @@ factories.gemini = function createGroq(modules) {
         desc: { type: 'STRING' },
         act: { type: 'STRING' },
         skill: { type: 'STRING', enum: modules.config.SKILL_NAMES },
-        difficulty: { type: 'STRING', enum: modules.config.DIFFICULTIES }
+        difficulty: { type: 'STRING', enum: modules.config.DIFFICULTIES },
+        setting: { type: 'STRING', enum: modules.config.SETTING_OPTIONS }
     };
-    const RESULT_SCHEMA = { type: 'OBJECT', properties: RESULT_PROPS, required: ['desc', 'act', 'skill', 'difficulty'], propertyOrdering: ['desc', 'act', 'skill', 'difficulty'] };
+    const RESULT_SCHEMA = { type: 'OBJECT', properties: RESULT_PROPS, required: ['desc', 'act', 'skill', 'difficulty', 'setting'], propertyOrdering: ['desc', 'act', 'skill', 'difficulty', 'setting'] };
     const BATCH_SCHEMA = {
         type: 'OBJECT',
         properties: {
             results: {
                 type: 'ARRAY',
-                items: { type: 'OBJECT', properties: Object.assign({ i: { type: 'INTEGER' } }, RESULT_PROPS), required: ['i', 'desc', 'act', 'skill', 'difficulty'] }
+                items: { type: 'OBJECT', properties: Object.assign({ i: { type: 'INTEGER' } }, RESULT_PROPS), required: ['i', 'desc', 'act', 'skill', 'difficulty', 'setting'] }
             }
         },
         required: ['results']
@@ -1506,6 +1521,18 @@ factories.gemini = function createGroq(modules) {
             || modules.config.SKILL_NAMES.find(n => n.toLowerCase().includes(t) || t.includes(n.toLowerCase()))
             || modules.config.DEFAULT_SKILL;
     }
+    function matchSetting(s) {
+        const t = String(s || '').trim().toLowerCase();
+        if (!t)
+            return modules.config.DEFAULT_SETTING;
+        if (/outdoor|outside|open[- ]?air|ngoai\s*troi|ngoài\s*trời/.test(t))
+            return 'Outdoor';
+        if (/indoor|inside|interior|trong\s*nha|trong\s*nhà|indoors/.test(t))
+            return 'Indoor';
+        return modules.config.SETTING_OPTIONS.find(n => n.toLowerCase() === t)
+            || modules.config.SETTING_OPTIONS.find(n => t.includes(n.toLowerCase()) || n.toLowerCase().includes(t))
+            || modules.config.DEFAULT_SETTING;
+    }
     function normalizeResult(o, fallbackText) {
         o = o || {};
         let desc = String(o.desc || fallbackText || '').replace(/\s+/g, ' ').trim().replace(/[.。]+$/, '');
@@ -1513,7 +1540,13 @@ factories.gemini = function createGroq(modules) {
             desc = desc[0].toUpperCase() + desc.slice(1);
         const act = toSlug(o.act) || toSlug(desc).split('-').slice(0, 4).join('-') || 'object-handling';
         const d = String(o.difficulty || '').trim().toLowerCase();
-        return { desc, act, skill: matchSkill(o.skill), difficulty: modules.config.DIFFICULTIES.find(x => x.toLowerCase() === d) || 'Easy' };
+        return {
+            desc,
+            act,
+            skill: matchSkill(o.skill),
+            difficulty: modules.config.DIFFICULTIES.find(x => x.toLowerCase() === d) || 'Easy',
+            setting: matchSetting(o.setting)
+        };
     }
     function contextLines(context) {
         const out = [];
@@ -1536,7 +1569,8 @@ factories.gemini = function createGroq(modules) {
                 desc: String(example.description || '').slice(0, 300),
                 act: String(example.activity || '').slice(0, 120),
                 skill: String(example.skill || '').slice(0, 120),
-                difficulty: String(example.difficulty || '').slice(0, 40)
+                difficulty: String(example.difficulty || '').slice(0, 40),
+                setting: String(example.setting || '').slice(0, 40)
             }))
         ];
     }
@@ -1548,15 +1582,15 @@ factories.gemini = function createGroq(modules) {
         const lines = [modules.config.PROMPT_RULES, ''].concat(contextLines(context), passExampleLines(examples));
         if (hasImg) {
             lines.push(`INPUT: ${frames.length} frames sampled in chronological order from a ${Math.round(durSec || 0)}-second first-person clip, arranged in one labeled contact sheet.`);
-            lines.push('Read the contact sheet panels in Frame 1 to Frame N order. Write "desc" from what the hands actually do, then derive act, skill and difficulty from it.');
+            lines.push('Read the contact sheet panels in Frame 1 to Frame N order. Write "desc" from what the hands actually do, then derive act, skill, difficulty and setting (Indoor/Outdoor) from it.');
             if (text)
                 lines.push(`Existing note (may be incomplete): ${JSON.stringify(text)}`);
         }
         else {
             lines.push(`INPUT DESCRIPTION (Vietnamese or English): ${JSON.stringify(text)}`);
-            lines.push('Translate/refine it into "desc" without adding new actions, then derive act, skill and difficulty from it.');
+            lines.push('Translate/refine it into "desc" without adding new actions, then derive act, skill, difficulty and setting (Indoor/Outdoor) from it.');
         }
-        lines.push('', 'OUTPUT: exactly one JSON object {"desc":"...","act":"...","skill":"...","difficulty":"..."}');
+        lines.push('', 'OUTPUT: exactly one JSON object {"desc":"...","act":"...","skill":"...","difficulty":"...","setting":"Indoor|Outdoor"}');
         const parts = [{ text: lines.join('\n') }];
         if (hasImg)
             parts.push({ inline_data: { mime_type: 'image/jpeg', data: contactSheet } });
@@ -1567,7 +1601,7 @@ factories.gemini = function createGroq(modules) {
         if (!obj || (!obj.desc && !obj.act))
             throw new Error('Groq trả JSON không hợp lệ: ' + String(raw).slice(0, 120));
         const r = normalizeResult(obj, text);
-        modules.logger.console.log(`🤖 [Groq ${hasImg ? 'ảnh' : 'text'}] ${r.desc} → ${r.act} | ${r.skill} | ${r.difficulty}`);
+        modules.logger.console.log(`🤖 [Groq ${hasImg ? 'ảnh' : 'text'}] ${r.desc} → ${r.act} | ${r.skill} | ${r.difficulty} | ${r.setting}`);
         return r;
     }
     /* ---------- Fill All: text/frames are combined into one indexed to-do list ---------- */
@@ -1605,15 +1639,15 @@ factories.gemini = function createGroq(modules) {
                         ? `DESCRIPTION: none. Analyze only this case\'s ${frames.length} chronological frame(s), shown as labeled panels in one contact sheet, from a ${Math.round(item.durSec || 0)}-second segment.`
                         : `INPUT DESCRIPTION (Vietnamese or English): ${JSON.stringify(String(item.text || ''))}`,
                     frames.length
-                        ? 'Read the contact sheet panels in Frame 1 to Frame N order. Write the description from the visible hand activity, then derive act, skill and difficulty.'
-                        : 'Translate Vietnamese or normalize English without adding actions, then derive act, skill and difficulty.'
+                        ? 'Read the contact sheet panels in Frame 1 to Frame N order. Write the description from the visible hand activity, then derive act, skill, difficulty and setting (Indoor/Outdoor).'
+                        : 'Translate Vietnamese or normalize English without adding actions, then derive act, skill, difficulty and setting (Indoor/Outdoor).'
                 ].join('\n')
             });
             if (frames.length)
                 parts.push({ inline_data: { mime_type: 'image/jpeg', data: contactSheet } });
         }
         parts.push({
-            text: `\nOUTPUT: exactly one JSON object {"results":[...]}. Include exactly ${cases.length} result objects in the array; each is {"i":index,"desc":"...","act":"...","skill":"...","difficulty":"..."}. Return every case index once.`
+            text: `\nOUTPUT: exactly one JSON object {"results":[...]}. Include exactly ${cases.length} result objects in the array; each is {"i":index,"desc":"...","act":"...","skill":"...","difficulty":"...","setting":"Indoor|Outdoor"}. Return every case index once.`
         });
         const raw = await geminiGenerate({ parts, schema: BATCH_SCHEMA, shouldAbort, onStatus });
         const parsed = parseJsonLoose(raw);
@@ -1646,6 +1680,7 @@ factories.gemini = function createGroq(modules) {
         get isDailyQuota() { return isDailyQuota; },
         get toOpenAiSchema() { return toOpenAiSchema; },
         get normalizeResult() { return normalizeResult; },
+        get matchSetting() { return matchSetting; },
         get toSlug() { return toSlug; },
         get matchSkill() { return matchSkill; },
         get parseJsonLoose() { return parseJsonLoose; },
@@ -1727,9 +1762,10 @@ factories.annotationDom = function createAnnotationDom(modules) {
         element.dispatchEvent(new Event('change', { bubbles: true }));
         return true;
     }
-    function clickOptionByText(targetText) {
+    function clickOptionByText(targetText, root = document) {
         const target = normalizeText(targetText);
-        const activeListboxes = Array.from(document.querySelectorAll('[role="listbox"], .dropdown-menu, .MuiAutocomplete-popper, [class*="dropdown"], [class*="menu"]'))
+        const scope = root && root.querySelectorAll ? root : document;
+        const activeListboxes = Array.from(scope.querySelectorAll('[role="listbox"], .dropdown-menu, .MuiAutocomplete-popper, [class*="dropdown"], [class*="menu"]'))
             .filter(el => el.offsetParent !== null);
         let candidates = [];
         if (activeListboxes.length > 0) {
@@ -1740,13 +1776,93 @@ factories.annotationDom = function createAnnotationDom(modules) {
             }
         }
         if (candidates.length === 0) {
-            candidates = Array.from(document.querySelectorAll('button, [role="option"], [role="button"], li, div, span'))
+            candidates = Array.from(scope.querySelectorAll('button, [role="option"], [role="button"], li, div, span'))
                 .filter(el => el.offsetParent !== null && normalizeText(el.textContent) === target);
         }
         if (candidates.length === 0)
             return false;
         candidates[0].click();
         return true;
+    }
+    function isToggleSelected(el) {
+        if (!el)
+            return false;
+        if (['aria-checked', 'aria-pressed', 'aria-selected', 'aria-current'].some(a => el.getAttribute(a) === 'true'))
+            return true;
+        const state = el.getAttribute('data-state');
+        if (state && /^(checked|on|active|selected)$/i.test(state))
+            return true;
+        const cls = (el.className && el.className.toString()) || '';
+        if (/(^|[\s_-])(selected|active|checked)([\s_-]|$)/i.test(cls))
+            return true;
+        const input = el.matches('input') ? el : el.querySelector('input[type="radio"], input[type="checkbox"]');
+        return !!(input && input.checked);
+    }
+    function findToggleGroup(root, selectors) {
+        const scope = root || document;
+        for (const selector of selectors) {
+            const group = scope.querySelector(selector);
+            if (group)
+                return group;
+        }
+        return null;
+    }
+    function readToggleGroupValue(root, optionNames, groupSelectors) {
+        const isVisible = el => el.offsetParent !== null || el.getClientRects().length > 0;
+        const group = findToggleGroup(root, groupSelectors);
+        const searchRoots = group ? [group] : [root || document];
+        for (const searchRoot of searchRoots) {
+            const candidates = Array.from(searchRoot.querySelectorAll('button, [role="button"], [role="radio"], [role="option"], [role="tab"], label, li'))
+                .filter(isVisible);
+            const hit = candidates.find(el => optionNames.some(n => normalizeText(n) === normalizeText(el.textContent)) && isToggleSelected(el));
+            if (hit)
+                return optionNames.find(n => normalizeText(n) === normalizeText(hit.textContent)) || '';
+        }
+        return '';
+    }
+    function setToggleGroupValue(root, value, optionNames, groupSelectors) {
+        const target = normalizeText(value);
+        const matched = optionNames.find(n => normalizeText(n) === target);
+        if (!matched)
+            return false;
+        const group = findToggleGroup(root, groupSelectors);
+        if (group) {
+            const buttons = Array.from(group.querySelectorAll('button, [role="button"], [role="radio"], [role="option"], [role="tab"]'));
+            const hit = buttons.find(el => normalizeText(el.textContent) === normalizeText(matched));
+            if (hit) {
+                if (isToggleSelected(hit))
+                    return true;
+                hit.click();
+                return true;
+            }
+        }
+        return clickOptionByText(matched, root || document);
+    }
+    const SETTING_GROUP_SELECTORS = [
+        '[data-testid="label-collection-setting"]',
+        '[data-testid*="collection_setting" i]',
+        '[data-testid*="collection-setting" i]',
+        '[id*="collection_setting" i]',
+        '[id*="collection-setting" i]'
+    ];
+    const REAL_WORK_GROUP_SELECTORS = [
+        '[data-testid="label-real-worker-status"]',
+        '[data-testid*="real_worker_status" i]',
+        '[data-testid*="real-worker" i]',
+        '[id*="real_worker_status" i]',
+        '[id*="real-worker" i]'
+    ];
+    function readSetting(root) {
+        return readToggleGroupValue(root, modules.config.SETTING_OPTIONS, SETTING_GROUP_SELECTORS);
+    }
+    function readRealWork(root) {
+        return readToggleGroupValue(root, modules.config.REAL_WORK_OPTIONS, REAL_WORK_GROUP_SELECTORS);
+    }
+    function setSetting(root, value) {
+        return setToggleGroupValue(root, value, modules.config.SETTING_OPTIONS, SETTING_GROUP_SELECTORS);
+    }
+    function setRealWork(root, value) {
+        return setToggleGroupValue(root, value, modules.config.REAL_WORK_OPTIONS, REAL_WORK_GROUP_SELECTORS);
     }
     async function setComboBoxValue(element, value, shouldContinue) {
         const canContinue = () => !shouldContinue || shouldContinue();
@@ -1840,7 +1956,9 @@ factories.annotationDom = function createAnnotationDom(modules) {
             activity: val(getActivityElement(root)),
             skillGroup: val(getSkillGroupElement(root)),
             difficulty: readDifficulty(root),
-            l3: val(getSceneElement(root))
+            l3: val(getSceneElement(root)),
+            setting: readSetting(root),
+            realWork: readRealWork(root)
         };
     }
     return {
@@ -1853,6 +1971,10 @@ factories.annotationDom = function createAnnotationDom(modules) {
         get setComboBoxValue() { return setComboBoxValue; },
         get clickOptionByText() { return clickOptionByText; },
         get readDifficulty() { return readDifficulty; },
+        get readSetting() { return readSetting; },
+        get readRealWork() { return readRealWork; },
+        get setSetting() { return setSetting; },
+        get setRealWork() { return setRealWork; },
         get getCurrentSegmentRoot() { return getCurrentSegmentRoot; }
     };
 };
@@ -2609,7 +2731,23 @@ factories.fill = function createFill(modules) {
         currentRoot = resolveRoot();
         const diffName = typeof result.difficulty === 'object' ? result.difficulty.name : result.difficulty;
         if (diffName && (!preserveExisting || !modules.annotationDom.readDifficulty(currentRoot)))
-            modules.annotationDom.clickOptionByText(diffName);
+            modules.annotationDom.clickOptionByText(diffName, currentRoot);
+
+        assertCurrent();
+        currentRoot = resolveRoot();
+        const settingName = typeof result.setting === 'object' ? result.setting.name : result.setting;
+        const settingValue = modules.gemini.matchSetting
+            ? modules.gemini.matchSetting(settingName)
+            : (settingName || modules.config.DEFAULT_SETTING);
+        if (settingValue && (!preserveExisting || !modules.annotationDom.readSetting(currentRoot)))
+            modules.annotationDom.setSetting(currentRoot, settingValue);
+
+        assertCurrent();
+        currentRoot = resolveRoot();
+        const realWorkName = typeof result.realWork === 'object' ? result.realWork.name : result.realWork;
+        const realWorkValue = realWorkName || modules.config.DEFAULT_REAL_WORK;
+        if (realWorkValue && (!preserveExisting || !modules.annotationDom.readRealWork(currentRoot)))
+            modules.annotationDom.setRealWork(currentRoot, realWorkValue);
 
         assertCurrent();
         currentRoot = resolveRoot();
@@ -2719,7 +2857,7 @@ factories.fill = function createFill(modules) {
                 segmentClipboard = modules.annotationDom.readCurrentSegmentData();
                 modules.storage.storageSet(modules.config.CLIPBOARD_KEY, segmentClipboard);
             }
-            modules.logger.console.log(`⚡ [Fill 1] ${fromCache ? '(cache) ' : ''}${target.mode === 'image' ? '(ảnh) ' : ''}${result.act} | ${result.skill} | ${result.difficulty}`);
+            modules.logger.console.log(`⚡ [Fill 1] ${fromCache ? '(cache) ' : ''}${target.mode === 'image' ? '(ảnh) ' : ''}${result.act} | ${result.skill} | ${result.difficulty} | ${result.setting || ''}`);
             setBtn(fromCache ? '✅ Done (cache)' : '✅ Done!', '#10b981');
             modules.runtime.notifyBg('✅ Fill 1 xong', result.act || '');
             setTimeout(() => fillSingleBtn && resetFillBtn(fillSingleBtn), 1200);
@@ -2799,7 +2937,21 @@ factories.fill = function createFill(modules) {
             if (el && !await modules.annotationDom.setComboBoxValue(el, data.l3, shouldContinue))
                 assertCurrent();
         }
+        if (data.setting) {
+            assertCurrent();
+            modules.annotationDom.setSetting(getRoot(), data.setting);
+        }
+        if (data.realWork) {
+            assertCurrent();
+            modules.annotationDom.setRealWork(getRoot(), data.realWork);
+        }
         assertCurrent();
+    }
+    function isSegmentFullyFilled(data) {
+        if (!data || typeof data !== 'object')
+            return false;
+        const has = value => !!String(value == null ? '' : value).trim();
+        return has(data.description) && has(data.activity) && has(data.skillGroup) && has(data.difficulty);
     }
 
     async function runPasteSegment() {
@@ -2847,20 +2999,26 @@ factories.fill = function createFill(modules) {
         return !!range && Math.abs(range.start - entry.start) <= 1.01;
     }
 
-    async function waitForPasteAllRowSelection(entry, identity) {
+    async function waitForRowSelection(entry, identity, isActive, changedError) {
         const deadline = Date.now() + 1500;
         for (;;) {
-            if (!isPasteAllRunning)
+            if (!isActive())
                 return false;
             if (!isSameTask(identity) || !pasteAllRowIsCurrent(entry))
-                throw new Error(PASTE_ALL_TARGET_CHANGED);
+                throw new Error(changedError);
             const range = modules.timeline.readActiveEpisodeRange();
             if (range && Math.abs(range.start - entry.start) <= 1.01)
                 return true;
             if (Date.now() >= deadline)
-                throw new Error(PASTE_ALL_TARGET_CHANGED);
+                throw new Error(changedError);
             await modules.runtime.sleep(50);
         }
+    }
+    async function waitForPasteAllRowSelection(entry, identity) {
+        return waitForRowSelection(entry, identity, () => isPasteAllRunning, PASTE_ALL_TARGET_CHANGED);
+    }
+    async function waitForFillAllRowSelection(entry, identity) {
+        return waitForRowSelection(entry, identity, () => isLoopRunning, FILL_TASK_CHANGED);
     }
 
     async function runPasteAllSegments() {
@@ -2884,7 +3042,9 @@ factories.fill = function createFill(modules) {
             ['activity', 'Activity'],
             ['skillGroup', 'Skill Group'],
             ['difficulty', 'Difficulty'],
-            ['l3', 'L3']
+            ['l3', 'L3'],
+            ['setting', 'Setting'],
+            ['realWork', 'Real work']
         ];
         const fields = fieldNames
             .filter(([key]) => data[key] != null && String(data[key]).trim())
@@ -2908,7 +3068,7 @@ factories.fill = function createFill(modules) {
             modules.logger.console.warn('[Paste All] Không xác định được danh tính hoặc thời gian của mọi segment; không có thay đổi nào được thực hiện.');
             return false;
         }
-        const confirmation = `Dán ${fields.join(', ')} vào tất cả ${entries.length} segment? Các trường có dữ liệu trong clipboard sẽ bị ghi đè trên mọi segment.`;
+        const confirmation = `Dán ${fields.join(', ')} từ trên xuống dưới vào ${entries.length} segment?\n\nSegment đã có đủ Description + Activity + Skill + Difficulty sẽ được bỏ qua.\nCác trường còn lại có dữ liệu trong clipboard sẽ bị ghi đè trên segment chưa full.`;
         if (!confirm(confirmation))
             return false;
         if (!isSameTask(identity)) {
@@ -2918,10 +3078,12 @@ factories.fill = function createFill(modules) {
 
         isPasteAllRunning = true;
         let completed = 0;
+        let skipped = 0;
         modules.runtime.bgBegin();
         setPasteAllButton('⏹ Stop Paste All', '#dc2626');
         try {
-            for (const entry of entries) {
+            for (let index = 0; index < entries.length; index++) {
+                const entry = entries[index];
                 if (!isPasteAllRunning)
                     break;
                 if (!isSameTask(identity) || !pasteAllRowIsCurrent(entry))
@@ -2936,27 +3098,34 @@ factories.fill = function createFill(modules) {
                 const shouldContinue = () => pasteAllTargetIsCurrent(entry, identity);
                 if (!shouldContinue())
                     throw new Error(PASTE_ALL_TARGET_CHANGED);
+                const currentData = modules.annotationDom.readCurrentSegmentData();
+                if (isSegmentFullyFilled(currentData)) {
+                    skipped++;
+                    setPasteAllButton(`⏭ Skip ${index + 1}/${entries.length}`, '#0284c7');
+                    modules.logger.console.log(`[Paste All] Bỏ qua segment ${index + 1}/${entries.length} (đã full)`);
+                    continue;
+                }
                 setPasteAllButton(`📥 Paste ${completed + 1}/${entries.length}`, '#0284c7');
                 await pasteSegmentData(data, () => modules.annotationDom.getCurrentSegmentRoot(), shouldContinue);
                 completed++;
             }
             if (!isPasteAllRunning) {
-                modules.runtime.notifyBg('⏹ Paste All đã dừng', `Đã dán ${completed}/${entries.length} segment.`);
+                modules.runtime.notifyBg('⏹ Paste All đã dừng', `Đã dán ${completed}, bỏ qua ${skipped}/${entries.length} segment.`);
             }
             else {
-                const message = `Đã dán annotation vào ${completed}/${entries.length} segment.`;
+                const message = `Đã dán ${completed}, bỏ qua ${skipped}/${entries.length} segment.`;
                 modules.logger.console.log('[Paste All] ' + message);
                 modules.runtime.notifyBg('✅ Paste All xong', message);
             }
         }
         catch (error) {
             if (error.message === PASTE_ALL_TARGET_CHANGED && !isPasteAllRunning) {
-                modules.runtime.notifyBg('⏹ Paste All đã dừng', `Đã dán ${completed}/${entries.length} segment.`);
+                modules.runtime.notifyBg('⏹ Paste All đã dừng', `Đã dán ${completed}, bỏ qua ${skipped}/${entries.length} segment.`);
             }
             else {
                 isPasteAllRunning = false;
                 modules.logger.console.error('[Paste All]', error.message || error);
-                modules.runtime.notifyBg('❌ Paste All dừng', `${completed}/${entries.length} segment: ${error.message || error}`);
+                modules.runtime.notifyBg('❌ Paste All dừng', `dán ${completed}, bỏ qua ${skipped}/${entries.length}: ${error.message || error}`);
             }
         }
         finally {
@@ -2964,7 +3133,7 @@ factories.fill = function createFill(modules) {
             modules.runtime.bgEnd();
             setPasteAllButton('📥 Paste All', '#0284c7');
         }
-        return completed === entries.length;
+        return completed + skipped === entries.length;
     }
 
     async function runLoopFillL3() {
@@ -3277,21 +3446,27 @@ factories.fill = function createFill(modules) {
         }
     }
 
+    function cloneSegmentTemplate(data) {
+        if (!data || typeof data !== 'object')
+            return null;
+        return {
+            description: data.description || '',
+            activity: data.activity || '',
+            skillGroup: data.skillGroup || '',
+            difficulty: data.difficulty || '',
+            l3: data.l3 || '',
+            setting: data.setting || '',
+            realWork: data.realWork || ''
+        };
+    }
+
     async function runLoopAllEpisodes() {
-        if (isLoopWorkerActive) {
-            if (isLoopRunning) {
-                isLoopRunning = false;
-                resumeRequested = false;
-                setLoopButtons('⏸ Pausing Fill All...', '#d97706');
-            }
-            else if (resumeRequested) {
-                resumeRequested = false;
-                setLoopButtons('▶ Resume Fill All', '#059669');
-            }
-            else {
-                resumeRequested = true;
-                setLoopButtons('⏳ Resume queued...', '#d97706');
-            }
+        // Cascade Fill All: walk top → bottom.
+        // Fully filled segment becomes the current template; incomplete segments below receive a copy.
+        // When another fully filled segment appears, switch template to that segment.
+        if (isLoopRunning || isLoopWorkerActive) {
+            isLoopRunning = false;
+            setLoopButtons('⏹ Stopping Fill All...', '#d97706');
             return;
         }
         if (isFillSingleRunning || isL3LoopRunning || isPasteAllRunning) {
@@ -3299,108 +3474,105 @@ factories.fill = function createFill(modules) {
             return;
         }
         discardStaleFillSession();
-        if (!fillSession) {
-            const rows = modules.timeline.getEpisodeRows();
-            if (!rows.length) {
-                alert('Không tìm thấy danh sách episode.');
-                return;
-            }
-            const identity = taskIdentity();
-            const needsFrames = rows.some(row => modules.media.rowLooksEmpty(row));
-            const sourceReady = modules.media.prepareFrameSource(needsFrames);
-            fillSession = createFillSession(rows, identity, sourceReady, needsFrames);
+        fillSession = null;
+        resumeRequested = false;
+
+        const rows = modules.timeline.getEpisodeRows();
+        if (!rows.length) {
+            alert('Không tìm thấy danh sách episode.');
+            return;
         }
-        else if (fillSession.rows.some(row => modules.media.rowLooksEmpty(row))
-            && !fillSession.frameSourceRequestedForImage) {
-            fillSession.frameSourceReady = modules.media.prepareFrameSource(true);
-            fillSession.frameSourceRequestedForImage = true;
+        const identity = taskIdentity();
+        const entries = rows.map(row => ({
+            row,
+            identity: rowIdentity(row),
+            start: modules.timeline.rowStartSec(row)
+        }));
+        if (entries.some(entry => !entry.identity || !Number.isFinite(entry.start))) {
+            modules.logger.console.warn('[Fill All] Không xác định được danh tính/thời gian của mọi segment.');
+            return;
         }
 
-        const session = fillSession;
-        session.runId++;
-        session.error = null;
         isLoopRunning = true;
         isLoopWorkerActive = true;
         modules.runtime.bgBegin();
-        const setLoop = (text, color) => setLoopButtons(text, color);
+        let filled = 0;
+        let skippedFull = 0;
+        let skippedNoTemplate = 0;
+        let template = null;
+        let templateIndex = -1;
+
         try {
-            setLoop('⏹ Stop Fill All', '#dc2626');
-            await collectSessionTargets(session, setLoop);
-            if (isLoopRunning)
-                await applyCachedTargets(session, setLoop);
-            while (isLoopRunning) {
-                if (session.activeBatch) {
-                    await applyActiveBatch(session, setLoop);
-                    if (!isLoopRunning)
-                        break;
-                }
-                const pending = pendingAiJobs(session);
-                if (!pending.length)
+            setLoopButtons('⏹ Stop Fill All', '#dc2626');
+            for (let index = 0; index < entries.length; index++) {
+                if (!isLoopRunning)
                     break;
-                const chunk = selectAiBatch(pending);
-                if (!chunk.length)
-                    throw new Error('Không tạo được batch Fill All; hãy kiểm tra giới hạn batch/image của Groq.');
-                await beginAiBatch(session, chunk, setLoop);
-                if (isLoopRunning)
-                    await applyActiveBatch(session, setLoop);
+                const entry = entries[index];
+                if (!isSameTask(identity) || !pasteAllRowIsCurrent(entry))
+                    throw new Error(FILL_TASK_CHANGED);
+
+                entry.row.scrollIntoView({ block: 'nearest' });
+                entry.row.click();
+                await modules.runtime.sleep(modules.config.CONFIG.delayBetweenEpisodes);
+                if (!isLoopRunning)
+                    break;
+                if (!await waitForFillAllRowSelection(entry, identity))
+                    break;
+
+                const shouldContinue = () => isLoopRunning
+                    && isSameTask(identity)
+                    && pasteAllRowIsCurrent(entry)
+                    && (() => {
+                        const range = modules.timeline.readActiveEpisodeRange();
+                        return !!range && Math.abs(range.start - entry.start) <= 1.01;
+                    })();
+                if (!shouldContinue())
+                    throw new Error(FILL_TASK_CHANGED);
+
+                const currentData = modules.annotationDom.readCurrentSegmentData();
+                if (isSegmentFullyFilled(currentData)) {
+                    template = cloneSegmentTemplate(currentData);
+                    templateIndex = index;
+                    skippedFull++;
+                    setLoopButtons(`📌 Mẫu ${index + 1}/${entries.length}`, '#0f766e');
+                    modules.logger.console.log(`[Fill All] Segment ${index + 1}/${entries.length} đã full → dùng làm mẫu`);
+                    continue;
+                }
+
+                if (!template || !isSegmentFullyFilled(template)) {
+                    skippedNoTemplate++;
+                    setLoopButtons(`⏭ Chờ mẫu ${index + 1}/${entries.length}`, '#0284c7');
+                    modules.logger.console.log(`[Fill All] Segment ${index + 1}/${entries.length} trống, chưa có mẫu phía trên → bỏ qua`);
+                    continue;
+                }
+
+                setLoopButtons(`📥 Fill ${index + 1}/${entries.length}`, '#4338ca');
+                await pasteSegmentData(template, () => modules.annotationDom.getCurrentSegmentRoot(), shouldContinue);
+                filled++;
+                modules.logger.console.log(`[Fill All] Đã copy mẫu segment ${templateIndex + 1} → segment ${index + 1}`);
             }
+
             if (!isLoopRunning) {
-                session.error = 'Paused';
-                return;
+                const message = `Đã dừng · điền ${filled}, mẫu ${skippedFull}, chờ mẫu ${skippedNoTemplate}/${entries.length}`;
+                modules.logger.console.log('[Fill All] ' + message);
+                modules.runtime.notifyBg('⏹ Fill All đã dừng', message);
             }
-            const unresolved = session.aiJobs.filter(job => job.status === 'failed' || job.status === 'pending').length;
-            const collectionComplete = session.collectIndex >= session.total;
-            const cacheComplete = session.cacheCursor >= session.cachedTargets.length;
-            if (collectionComplete && cacheComplete && !session.activeBatch && !unresolved) {
-                const message = `Đã điền ${session.stats.filled}/${session.total} segment (từ ảnh: ${session.stats.fromImage}, cache: ${session.stats.fromCache}, bỏ qua: ${session.stats.skipped}) · Groq: ${modules.gemini.gem.calls - session.callsAtStart} lần gọi, 429: ${modules.gemini.gem.hits429 - session.hits429AtStart}`;
+            else {
+                const message = `Đã điền ${filled} segment (từ ${skippedFull} mẫu; bỏ qua ${skippedNoTemplate} chưa có mẫu)`;
                 modules.logger.console.log('✅ [Fill All] ' + message);
                 modules.runtime.notifyBg('✅ Fill All xong', message);
-                fillSession = null;
-            }
-            else if (collectionComplete && cacheComplete && !session.activeBatch) {
-                const failedSegments = session.aiJobs
-                    .filter(job => job.status === 'failed')
-                    .reduce((sum, job) => sum + job.targets.filter(target => target.status === 'pending').length, 0);
-                session.error = `${failedSegments} segment chưa có kết quả AI`;
-                modules.logger.console.warn('[Fill All] ' + session.error + '; bấm lại để thử lại các case lỗi.');
-                modules.runtime.notifyBg('⚠️ Fill All cần thử lại', session.error);
             }
         }
         catch (error) {
-            if (error.message === FILL_TASK_CHANGED || error.message === FILL_SESSION_STALE) {
-                modules.logger.console.warn('[Fill All] Phiên đã dừng vì task/segment không còn khớp; hãy chạy lại từ đầu.');
-                modules.runtime.notifyBg('⏹ Fill All dừng', error.message);
-                fillSession = null;
-            }
-            else if (error.message === 'ABORTED') {
-                session.error = 'Paused';
-            }
-            else {
-                session.error = error.message || String(error);
-                modules.logger.console.error('❌ [Fill All]', session.error);
-                if (error instanceof modules.gemini.GroqApiError)
-                    alert('Fill All: ' + error.message);
-                modules.runtime.notifyBg('❌ Fill All lỗi', session.error);
-            }
+            isLoopRunning = false;
+            modules.logger.console.error('❌ [Fill All]', error.message || error);
+            modules.runtime.notifyBg('❌ Fill All lỗi', `${filled} đã điền: ${error.message || error}`);
         }
         finally {
             isLoopRunning = false;
             isLoopWorkerActive = false;
             modules.runtime.bgEnd();
-            const resume = resumeRequested && !!fillSession && isSameTask(fillSession.identity);
-            if (resumeRequested && fillSession && !resume) {
-                fillSession = null;
-                modules.runtime.notifyBg('⏹ Fill All dừng', FILL_TASK_CHANGED);
-            }
-            resumeRequested = false;
-            if (resume) {
-                setLoopButtons('⏳ Resuming Fill All...', '#d97706');
-                runLoopAllEpisodes();
-            }
-            else if (fillSession)
-                setLoopButtons('▶ Resume Fill All', '#059669');
-            else
-                resetLoopButtons();
+            resetLoopButtons();
         }
     }
 
@@ -3577,16 +3749,65 @@ factories.auth = function createAuth(modules) {
         if (initialized)
             return;
         initialized = true;
-        modules.environment.W.fetch = function (input, init) {
+        let submitRefreshTimer = null;
+        function scheduleWorkDataRefreshAfterSubmit(reason) {
             try {
-                const url = typeof input === "string" ? input : input instanceof URL ? input.href : input && input.url;
+                if (!modules.workData || typeof modules.workData.refreshAfterSubmit !== 'function')
+                    return;
+                if (submitRefreshTimer)
+                    clearTimeout(submitRefreshTimer);
+                // Short debounce so a burst of submit-related requests only triggers one refresh.
+                submitRefreshTimer = setTimeout(() => {
+                    submitRefreshTimer = null;
+                    modules.logger.console.info('[workData] Refresh after submit:', reason || '');
+                    void modules.workData.refreshAfterSubmit();
+                }, 1200);
+            }
+            catch (_) { }
+        }
+        function isSubmitMutation(url, method) {
+            const m = String(method || 'GET').toUpperCase();
+            if (m !== 'POST' && m !== 'PUT' && m !== 'PATCH')
+                return false;
+            const u = String(url || '');
+            return /\/api\/v1\/submissions\b/i.test(u)
+                || /\/api\/v1\/tasks\/[^/]+\/(submit|complete)/i.test(u)
+                || /[?&]action=submit\b/i.test(u);
+        }
+        modules.environment.W.fetch = function (input, init) {
+            let url = '';
+            let method = 'GET';
+            try {
+                url = typeof input === "string" ? input : input instanceof URL ? input.href : input && input.url;
+                method = (init && init.method) || (input && input.method) || 'GET';
                 const auth = readHeaders(init && init.headers) || readHeaders(input && input.headers);
                 if (auth)
                     captureAuth(auth, url);
             }
             catch (_) { }
-            return origFetch.apply(this, arguments);
+            const promise = origFetch.apply(this, arguments);
+            if (isSubmitMutation(url, method)) {
+                promise.then(response => {
+                    if (response && response.ok)
+                        scheduleWorkDataRefreshAfterSubmit(method + ' ' + url);
+                }).catch(() => { });
+            }
+            return promise;
         };
+        // Fallback: native Submit buttons on the task page (in case submit is not pure REST).
+        document.addEventListener('click', event => {
+            const btn = event.target && event.target.closest
+                ? event.target.closest('button, [role="button"], input[type="submit"]')
+                : null;
+            if (!btn) return;
+            const label = String(btn.textContent || btn.value || btn.getAttribute('aria-label') || '')
+                .replace(/\s+/g, ' ').trim().toLowerCase();
+            if (!label) return;
+            if (/^(submit|gửi|nộp|gửi bài|submit task|submit for review)$/i.test(label)
+                || /\bsubmit\b/i.test(label) && label.length < 40) {
+                scheduleWorkDataRefreshAfterSubmit('ui:' + label);
+            }
+        }, true);
         xhrProto.open = function (method, url) { this.tbMonitorUrl = String(url); return origOpen.apply(this, arguments); };
         xhrProto.setRequestHeader = function (name, value) {
             if (String(name).toLowerCase() === "authorization")
@@ -4596,6 +4817,13 @@ factories.taskMonitor = function createTaskMonitor(modules) {
             stopped = !!value;
             if (stopped)
                 S().monitor = 'off';
+        },
+        get waitForRateLimit() { return waitForRateLimit; },
+        get readRateLimitHeaders() { return readRateLimitHeaders; },
+        get rateLimitState() { return rateLimitState; },
+        notifyRateLimit(response) {
+            if (response)
+                readRateLimitHeaders(response);
         }
     };
 };
@@ -5742,6 +5970,779 @@ factories.controls = function createControls(modules) {
     };
 };
 
+// MODULE: workData
+/**
+ * workData
+ * Single source of truth for labelling time / earnings data.
+ * One fetch pipeline, one cache, one aggregation API for header earnings,
+ * earnings range panel, and Working time tab.
+ * Incremental: only re-fetch task/submission details when status may have changed;
+ * past days are treated as fixed. Shares rate-limit pause with taskMonitor.
+ * Dependencies: auth, config, environment, logger, runtime, taskMonitor.
+ */
+factories.workData = function createWorkData(modules) {
+    'use strict';
+    const UTC_PLUS_7_MS = 7 * 60 * 60 * 1000;
+    const TASK_PAGE_SIZE = 100;
+    const DETAIL_CONCURRENCY = 3;
+    const REQUEST_DELAY_MS = 180;
+    const CACHE_TTL_MS = 15 * 60 * 1000;
+    const CACHE_PREFIX = 'tb-workdata-cache:';
+    const LISTENERS = new Set();
+
+    const state = {
+        projectId: '',
+        cache: null,
+        aggregate: null,
+        loading: false,
+        loadingPromise: null,
+        lastError: '',
+        lastRefreshAt: 0,
+        status: 'idle'
+    };
+
+    function pad2(n) { return String(n).padStart(2, '0'); }
+    function padYear(n) { return String(n).padStart(4, '0'); }
+
+    function timestampFromValue(value) {
+        if (value instanceof Date) return value.getTime();
+        if (typeof value === 'number' && Number.isFinite(value))
+            return Math.abs(value) < 1e12 ? value * 1000 : value;
+        if (typeof value !== 'string' || !value.trim()) return NaN;
+        const text = value.trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return NaN;
+        const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+        const normalized = !hasTimezone && /^\d{4}-\d{2}-\d{2}[T ]/.test(text)
+            ? text.replace(' ', 'T') + 'Z' : text;
+        return Date.parse(normalized);
+    }
+
+    function localDateKey(value) {
+        if (arguments.length === 0) value = new Date();
+        if (typeof value === 'string') {
+            const text = value.trim();
+            const m = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (m) {
+                const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+                if (y >= 1970 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) return text;
+                return '';
+            }
+        }
+        const ts = timestampFromValue(value);
+        if (!Number.isFinite(ts)) return '';
+        const shifted = new Date(ts + UTC_PLUS_7_MS);
+        if (!Number.isFinite(shifted.getTime())) return '';
+        return `${padYear(shifted.getUTCFullYear())}-${pad2(shifted.getUTCMonth() + 1)}-${pad2(shifted.getUTCDate())}`;
+    }
+
+    function localMonthKey(value) {
+        if (arguments.length === 0) value = new Date();
+        const key = localDateKey(value);
+        return key ? key.slice(0, 7) : '';
+    }
+
+    function isValidDateKey(value) {
+        return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && localDateKey(value) === value;
+    }
+
+    function parseNonNegativeSeconds(value) {
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+        if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value)) && Number(value) >= 0)
+            return Number(value);
+        return null;
+    }
+
+    function formatDuration(seconds) {
+        if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return '—';
+        const totalMinutes = Math.floor(seconds / 60);
+        const hours = Math.floor(totalMinutes / 60);
+        const minutes = totalMinutes % 60;
+        const hDec = (seconds / 3600).toFixed(2);
+        return `${hours}h ${String(minutes).padStart(2, '0')}m (${hDec}h)`;
+    }
+
+    function formatDurationShort(seconds) {
+        if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return '—';
+        const totalMinutes = Math.floor(seconds / 60);
+        const hours = Math.floor(totalMinutes / 60);
+        const minutes = totalMinutes % 60;
+        return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+    }
+
+    function formatMoney(amount) {
+        return `${Math.round(amount).toLocaleString('vi-VN')} đ`;
+    }
+
+    function ratePerHour() {
+        return Number(modules.config.EARNINGS_RATE_VND_PER_HOUR) || 50000;
+    }
+
+    function moneyFromSeconds(seconds) {
+        if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return 0;
+        return (seconds / 3600) * ratePerHour();
+    }
+
+    /** Classify a submission/task record for earnings.
+     *  delivered → paid hours/money
+     *  pending   → Submitted / Rework (count + estimated money only)
+     *  skip      → draft / claimed / empty
+     */
+    function classifyRecord(rec) {
+        if (!rec) return 'skip';
+        const taskStatus = String(rec.taskStatus || '').toLowerCase().trim().replace(/[_\s]+/g, ' ');
+        const subStatus = String(rec.status || '').toLowerCase().trim().replace(/[_\s]+/g, ' ');
+        const combined = taskStatus || subStatus;
+        if (!combined || combined === 'draft' || combined === 'claimed') return 'skip';
+        // Explicit delivered / approved / passed (prefer task status)
+        const deliveredTokens = ['delivered', 'approved', 'passed', 'pass', 'accepted', 'completed'];
+        if (deliveredTokens.some(t => taskStatus === t || taskStatus.startsWith(t + ' ')))
+            return 'delivered';
+        if (!taskStatus && deliveredTokens.some(t => subStatus === t || subStatus.startsWith(t + ' ')))
+            return 'delivered';
+        // Submitted / rework / review / pending QC
+        if (taskStatus.includes('submit') || taskStatus.includes('rework') || taskStatus.includes('review')
+            || taskStatus === 'pending' || taskStatus.includes('qc')
+            || subStatus.includes('submit') || subStatus.includes('rework') || subStatus.includes('review')
+            || subStatus === 'pending')
+            return 'pending';
+        // Unknown with taskStatus present → treat as pending (do not pay)
+        if (taskStatus) return 'pending';
+        // Legacy cache without taskStatus: keep counting as delivered so money does not vanish
+        // until the next refresh rewrites taskStatus from the live task list.
+        return 'delivered';
+    }
+
+    function apiUrl(path) { return `${modules.config.API_BASE}${path}`; }
+
+    async function getJson(url, token) {
+        if (modules.taskMonitor && typeof modules.taskMonitor.waitForRateLimit === 'function') {
+            try { await modules.taskMonitor.waitForRateLimit(); } catch (_) {}
+        }
+        const controller = new AbortController();
+        const timeoutMs = Math.max(15000, Number(modules.config.REQUEST_TIMEOUT) || 0);
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await modules.auth.origFetch.call(modules.environment.W, url, {
+                method: 'GET',
+                headers: { Authorization: 'Bearer ' + token, Accept: 'application/json' },
+                credentials: 'include',
+                cache: 'no-store',
+                signal: controller.signal
+            });
+            if (modules.taskMonitor && typeof modules.taskMonitor.notifyRateLimit === 'function')
+                modules.taskMonitor.notifyRateLimit(response);
+            if (response.status === 429) {
+                if (modules.taskMonitor && typeof modules.taskMonitor.waitForRateLimit === 'function')
+                    await modules.taskMonitor.waitForRateLimit();
+                throw new Error('HTTP 429 rate limited');
+            }
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return await response.json();
+        }
+        finally { clearTimeout(timeout); }
+    }
+
+    function submissionEpisodeSeconds(submission) {
+        if (!submission || !Array.isArray(submission.artifacts)) return null;
+        let total = 0, valid = 0;
+        for (const artifact of submission.artifacts) {
+            const episodes = artifact && artifact.data && artifact.data.episodes;
+            if (!Array.isArray(episodes)) continue;
+            for (const episode of episodes) {
+                if (!episode || typeof episode !== 'object') continue;
+                const start = parseNonNegativeSeconds(episode.start_seconds);
+                const end = parseNonNegativeSeconds(episode.end_seconds);
+                if (start === null || end === null || end < start) continue;
+                const dur = end - start;
+                if (!Number.isFinite(dur) || !Number.isFinite(total + dur)) continue;
+                total += dur;
+                valid++;
+            }
+        }
+        return valid ? total : null;
+    }
+
+    function taskRows(payload) {
+        if (Array.isArray(payload)) return payload;
+        if (!payload || typeof payload !== 'object') return null;
+        for (const key of ['data', 'tasks', 'items', 'results'])
+            if (Array.isArray(payload[key])) return payload[key];
+        return null;
+    }
+
+    function taskPageCount(payload) {
+        if (Array.isArray(payload)) return 1;
+        const raw = payload && payload.pagination ? payload.pagination.total : null;
+        const total = Number(raw);
+        if (!Number.isSafeInteger(total) || total < 0)
+            throw new Error('Task list pagination.total is invalid');
+        return Math.max(1, Math.ceil(total / TASK_PAGE_SIZE));
+    }
+
+    function isValidTaskList(payload) {
+        return Array.isArray(payload)
+            || !!(payload && typeof payload === 'object'
+                && (Array.isArray(payload.data) || Array.isArray(payload.tasks)
+                    || Array.isArray(payload.items) || Array.isArray(payload.results)));
+    }
+
+    function recordDateKey(record) {
+        if (!record || typeof record !== 'object' || Array.isArray(record)) return '';
+        for (const field of [
+            'date', 'day', 'dateKey', 'createdAt', 'created_at',
+            'recordedAt', 'recorded_at', 'timestamp', 'startDate', 'start_date'
+        ]) {
+            const key = localDateKey(record[field]);
+            if (key) return key;
+        }
+        return '';
+    }
+
+    function readExtraHourRecords(extraData) {
+        const records = [];
+        if (!Array.isArray(extraData)) return records;
+        for (const item of extraData) {
+            const dateKey = recordDateKey(item);
+            if (!dateKey) continue;
+            const seconds = item && parseNonNegativeSeconds(item.seconds);
+            if (seconds === null) continue;
+            records.push({ dateKey, seconds });
+        }
+        return records;
+    }
+
+    function loadCache(projectId) {
+        if (!projectId) return null;
+        try {
+            const raw = localStorage.getItem(CACHE_PREFIX + projectId);
+            if (!raw) return null;
+            const value = JSON.parse(raw);
+            if (!value || value.version !== 1 || value.projectId !== projectId
+                || !value.submissions || typeof value.submissions !== 'object')
+                return null;
+            return value;
+        } catch (_) { return null; }
+    }
+
+    function saveCache(projectId, cache) {
+        if (!projectId || !cache || cache.projectId !== projectId) return false;
+        try {
+            localStorage.setItem(CACHE_PREFIX + projectId, JSON.stringify(cache));
+            return true;
+        } catch (error) {
+            modules.logger.console.warn('[workData] Could not persist cache:', error);
+            return false;
+        }
+    }
+
+    function isCacheFresh(cache) {
+        if (!cache || !Number.isFinite(cache.updatedAt)) return false;
+        const age = Date.now() - cache.updatedAt;
+        return age >= 0 && age < CACHE_TTL_MS;
+    }
+
+    function emptyDay() {
+        return {
+            seconds: 0, submissions: 0,
+            deliveredSeconds: 0, deliveredSubmissions: 0,
+            pendingSeconds: 0, pendingSubmissions: 0
+        };
+    }
+    function emptyMonth() {
+        return {
+            totalSeconds: 0, submissions: 0, activeDays: 0,
+            deliveredSeconds: 0, deliveredSubmissions: 0,
+            pendingSeconds: 0, pendingSubmissions: 0,
+            days: Object.create(null)
+        };
+    }
+
+    function aggregateFromCache(cache) {
+        const months = Object.create(null);
+        const ensureMonth = (dateKey) => {
+            const monthKey = dateKey.slice(0, 7);
+            if (!months[monthKey]) months[monthKey] = emptyMonth();
+            const month = months[monthKey];
+            if (!month.days[dateKey]) month.days[dateKey] = emptyDay();
+            return month;
+        };
+        const bump = (dateKey, seconds, kind, bucket) => {
+            if (!isValidDateKey(dateKey)) return;
+            const sec = parseNonNegativeSeconds(seconds);
+            if (sec === null) return;
+            const month = ensureMonth(dateKey);
+            const day = month.days[dateKey];
+            if (!Number.isFinite(month.totalSeconds + sec) || !Number.isFinite(day.seconds + sec)) return;
+            // totalSeconds keeps all paid+pending for activity views; money uses delivered*
+            month.totalSeconds += sec;
+            day.seconds += sec;
+            if (kind === 'submission') {
+                month.submissions++;
+                day.submissions++;
+                if (bucket === 'delivered') {
+                    month.deliveredSeconds += sec;
+                    month.deliveredSubmissions++;
+                    day.deliveredSeconds += sec;
+                    day.deliveredSubmissions++;
+                } else if (bucket === 'pending') {
+                    month.pendingSeconds += sec;
+                    month.pendingSubmissions++;
+                    day.pendingSeconds += sec;
+                    day.pendingSubmissions++;
+                }
+            } else if (kind === 'extra') {
+                // Extra hours are already approved time → count as delivered for money
+                month.deliveredSeconds += sec;
+                day.deliveredSeconds += sec;
+            }
+        };
+        if (cache && cache.submissions) {
+            for (const record of Object.values(cache.submissions)) {
+                if (!record) continue;
+                const bucket = classifyRecord(record);
+                if (bucket === 'skip') continue;
+                bump(record.submittedDay, record.seconds, 'submission', bucket);
+            }
+        }
+        if (cache && Array.isArray(cache.extraHours)) {
+            for (const record of cache.extraHours)
+                bump(record.dateKey, record.seconds, 'extra', 'delivered');
+        }
+        for (const month of Object.values(months))
+            month.activeDays = Object.values(month.days).filter(d => d.seconds > 0).length;
+        return { months };
+    }
+
+    function indexCacheByTaskId(cache) {
+        const byTaskId = new Map();
+        if (!cache || !cache.submissions) return byTaskId;
+        for (const [submissionId, record] of Object.entries(cache.submissions)) {
+            if (!record || !record.taskId) continue;
+            byTaskId.set(String(record.taskId), { ...record, submissionId });
+        }
+        return byTaskId;
+    }
+
+    async function mapWithConcurrency(items, concurrency, callback) {
+        const errors = [];
+        let nextIndex = 0;
+        const workerCount = Math.min(Math.max(1, concurrency), Math.max(1, items.length));
+        const workers = Array.from({ length: workerCount }, async () => {
+            for (;;) {
+                const index = nextIndex++;
+                if (index >= items.length) return;
+                try { await callback(items[index], index); }
+                catch (error) { errors.push(error); }
+            }
+        });
+        await Promise.all(workers);
+        return errors;
+    }
+
+    async function fetchData(projectId, previousCache) {
+        if (!projectId) throw new Error('Project ID is unavailable');
+        const candidate = modules.auth.findToken() || modules.auth.findToken(true);
+        if (!candidate || !candidate.token)
+            throw new Error('Tbrain sign-in session is unavailable');
+        const token = candidate.token;
+        const today = localDateKey();
+        const encoded = encodeURIComponent(projectId);
+
+        const [statsData, extraData, firstPage] = await Promise.all([
+            getJson(apiUrl(`/api/v1/tasks/my-stats?projectId=${encoded}`), token),
+            getJson(apiUrl(`/api/v1/my/extra-hours?projectId=${encoded}`), token),
+            getJson(apiUrl(`/api/v1/tasks?page=1&pageSize=${TASK_PAGE_SIZE}&projectId=${encoded}`), token)
+        ]);
+        if (!statsData || typeof statsData !== 'object' || Array.isArray(statsData))
+            throw new Error('my-stats response is invalid');
+        if (!Array.isArray(extraData))
+            throw new Error('extra-hours response is invalid');
+        if (!isValidTaskList(firstPage))
+            throw new Error('Task list response is invalid');
+
+        const approvedSeconds = parseNonNegativeSeconds(statsData.approvedSeconds);
+        const reportSessionsValue = parseNonNegativeSeconds(statsData.sessions);
+        const reportSessions = reportSessionsValue === null ? null : Math.floor(reportSessionsValue);
+        const extraHours = readExtraHourRecords(extraData);
+
+        const tasks = (taskRows(firstPage) || []).slice();
+        const pages = taskPageCount(firstPage);
+        for (let page = 2; page <= pages; page++) {
+            await modules.runtime.bgSleep(REQUEST_DELAY_MS);
+            const result = await getJson(
+                apiUrl(`/api/v1/tasks?page=${page}&pageSize=${TASK_PAGE_SIZE}&projectId=${encoded}`), token);
+            const rows = taskRows(result);
+            if (!Array.isArray(rows))
+                throw new Error(`Task list page ${page} is invalid`);
+            tasks.push(...rows);
+        }
+
+        const uniqueTasks = new Map();
+        for (const task of tasks) {
+            const taskId = task && (task.id !== undefined ? task.id
+                : task.taskId !== undefined ? task.taskId : task._id);
+            if (taskId === null || taskId === undefined || String(taskId).trim() === '') continue;
+            uniqueTasks.set(String(taskId), task);
+        }
+
+        const prevByTask = indexCacheByTaskId(previousCache);
+        const submissions = Object.create(null);
+        if (previousCache && previousCache.submissions) {
+            for (const [sid, rec] of Object.entries(previousCache.submissions)) {
+                if (rec && isValidDateKey(rec.submittedDay) && rec.submittedDay < today)
+                    submissions[sid] = { ...rec };
+            }
+        }
+
+        const needDetail = [];
+        for (const [taskId, task] of uniqueTasks) {
+            const taskStatus = typeof task.status === 'string' ? task.status.toLowerCase() : '';
+            if (taskStatus === 'claimed') continue;
+            const cached = prevByTask.get(taskId);
+            if (cached && cached.submittedDay && cached.submittedDay < today
+                && typeof cached.seconds === 'number' && cached.seconds >= 0) {
+                // Prefer live task list status so Submitted → Delivered transitions
+                // update earnings classification without re-fetching submission details.
+                submissions[cached.submissionId || ('task:' + taskId)] = {
+                    taskId, submittedDay: cached.submittedDay, seconds: cached.seconds,
+                    status: cached.status || 'submitted',
+                    taskStatus: taskStatus || cached.taskStatus || ''
+                };
+                continue;
+            }
+            if (cached && cached.taskStatus === taskStatus && cached.status === 'draft') continue;
+            needDetail.push({ taskId, taskStatus });
+        }
+
+        const errors = await mapWithConcurrency(needDetail, DETAIL_CONCURRENCY, async ({ taskId, taskStatus }) => {
+            await modules.runtime.bgSleep(REQUEST_DELAY_MS);
+            const taskDetails = await getJson(apiUrl(`/api/v1/tasks/${encodeURIComponent(taskId)}`), token);
+            if (!taskDetails || typeof taskDetails !== 'object' || Array.isArray(taskDetails))
+                throw new Error(`Task detail ${taskId} is invalid`);
+            const submissionIdValue = taskDetails.submission && taskDetails.submission.id;
+            if (submissionIdValue === null || submissionIdValue === undefined || String(submissionIdValue).trim() === '')
+                return;
+            const submissionId = String(submissionIdValue);
+            await modules.runtime.bgSleep(REQUEST_DELAY_MS);
+            const submission = await getJson(apiUrl(`/api/v1/submissions/${encodeURIComponent(submissionId)}`), token);
+            if (!submission || typeof submission !== 'object' || Array.isArray(submission))
+                throw new Error(`Submission ${submissionId} is invalid`);
+            const status = typeof submission.status === 'string' ? submission.status.trim().toLowerCase() : '';
+            if (status === 'draft') {
+                submissions[submissionId] = {
+                    taskId, submittedDay: null, seconds: 0, status: 'draft', taskStatus
+                };
+                return;
+            }
+            const submittedDay = localDateKey(submission.submittedAt);
+            if (!submittedDay) return;
+            const seconds = submissionEpisodeSeconds(submission);
+            if (seconds === null) return;
+            submissions[submissionId] = {
+                taskId, submittedDay, seconds, status: status || 'submitted', taskStatus
+            };
+        });
+
+        if (errors.length)
+            modules.logger.console.warn(`[workData] ${errors.length} task detail error(s); kept partial data. First:`,
+                errors[0] && errors[0].message);
+
+        const publicSubmissions = Object.create(null);
+        for (const [sid, rec] of Object.entries(submissions)) {
+            if (!rec || rec.status === 'draft' || !rec.submittedDay) continue;
+            publicSubmissions[sid] = {
+                taskId: rec.taskId, submittedDay: rec.submittedDay, seconds: rec.seconds,
+                status: rec.status, taskStatus: rec.taskStatus || ''
+            };
+        }
+
+        return {
+            version: 1, projectId, updatedAt: Date.now(),
+            submissions: publicSubmissions, extraHours, reportSessions,
+            accessibleSubmissions: Object.keys(publicSubmissions).length,
+            approvedSeconds: approvedSeconds === null ? null : approvedSeconds
+        };
+    }
+
+    function emit() {
+        for (const fn of Array.from(LISTENERS)) {
+            try { fn(snapshot()); }
+            catch (error) { modules.logger.console.warn('[workData] listener error:', error); }
+        }
+    }
+
+    function applyCache(cache) {
+        state.cache = cache;
+        state.aggregate = aggregateFromCache(cache);
+        state.lastRefreshAt = cache && cache.updatedAt ? cache.updatedAt : Date.now();
+        state.lastError = '';
+        emit();
+    }
+
+    function ensureProject(projectId) {
+        const id = projectId || modules.config.PROJECT_ID || '';
+        if (id && id !== state.projectId) {
+            state.projectId = id;
+            const cached = loadCache(id);
+            if (cached) {
+                state.cache = cached;
+                state.aggregate = aggregateFromCache(cached);
+                state.status = isCacheFresh(cached) ? 'updated' : 'idle';
+            } else {
+                state.cache = null;
+                state.aggregate = null;
+                state.status = 'idle';
+            }
+        }
+        return state.projectId;
+    }
+
+    async function refresh(options = {}) {
+        const force = !!options.force;
+        const projectId = ensureProject(options.projectId);
+        if (!projectId) {
+            state.lastError = 'Project ID is unavailable';
+            state.status = 'load-error';
+            return false;
+        }
+        if (state.loading) return state.loadingPromise || false;
+        if (!force && isCacheFresh(state.cache)) {
+            state.status = 'updated';
+            return true;
+        }
+        state.loading = true;
+        state.status = state.cache ? 'refreshing' : 'loading';
+        state.lastError = '';
+        emit();
+        const request = (async () => {
+            try {
+                modules.runtime.bgBegin();
+                const fetched = await fetchData(projectId, state.cache);
+                saveCache(projectId, fetched);
+                applyCache(fetched);
+                state.status = 'updated';
+                return true;
+            } catch (error) {
+                state.lastError = error && error.message ? error.message : String(error);
+                state.status = state.cache ? 'cached-failed' : 'load-error';
+                modules.logger.console.warn('[workData] Refresh failed:', error);
+                emit();
+                return false;
+            } finally {
+                modules.runtime.bgEnd();
+                state.loading = false;
+                state.loadingPromise = null;
+            }
+        })();
+        state.loadingPromise = request;
+        return request;
+    }
+
+    function refreshAfterSubmit() { return refresh({ force: true }); }
+
+    function rangeSeconds(fromDateKey, toDateKey) {
+        const agg = state.aggregate;
+        const empty = {
+            seconds: 0, submissions: 0, days: 0,
+            deliveredSeconds: 0, deliveredSubmissions: 0,
+            pendingSeconds: 0, pendingSubmissions: 0
+        };
+        if (!agg || !agg.months) return empty;
+        let seconds = 0, submissions = 0;
+        let deliveredSeconds = 0, deliveredSubmissions = 0;
+        let pendingSeconds = 0, pendingSubmissions = 0;
+        const daySet = new Set();
+        for (const month of Object.values(agg.months)) {
+            for (const [dayKey, day] of Object.entries(month.days || {})) {
+                if (fromDateKey && dayKey < fromDateKey) continue;
+                if (toDateKey && dayKey > toDateKey) continue;
+                seconds += day.seconds || 0;
+                submissions += day.submissions || 0;
+                deliveredSeconds += day.deliveredSeconds || 0;
+                deliveredSubmissions += day.deliveredSubmissions || 0;
+                pendingSeconds += day.pendingSeconds || 0;
+                pendingSubmissions += day.pendingSubmissions || 0;
+                if ((day.seconds || 0) > 0) daySet.add(dayKey);
+            }
+        }
+        return {
+            seconds, submissions, days: daySet.size,
+            deliveredSeconds, deliveredSubmissions,
+            pendingSeconds, pendingSubmissions
+        };
+    }
+
+    function daySeconds(dateKey) {
+        if (!isValidDateKey(dateKey) || !state.aggregate) return 0;
+        const month = state.aggregate.months[dateKey.slice(0, 7)];
+        if (!month || !month.days[dateKey]) return 0;
+        return month.days[dateKey].seconds || 0;
+    }
+
+    function monthSeconds(monthKey) {
+        if (!monthKey || !state.aggregate) return 0;
+        const month = state.aggregate.months[monthKey];
+        return month ? (month.totalSeconds || 0) : 0;
+    }
+
+    function totalSeconds() {
+        if (!state.aggregate) return 0;
+        let total = 0;
+        for (const month of Object.values(state.aggregate.months))
+            total += month.totalSeconds || 0;
+        return total;
+    }
+
+    function reportedTotalSeconds() {
+        const cache = state.cache;
+        if (!cache) return totalSeconds();
+        if (typeof cache.approvedSeconds === 'number' && Number.isFinite(cache.approvedSeconds)) {
+            const extra = Array.isArray(cache.extraHours)
+                ? cache.extraHours.reduce((s, r) => s + (r.seconds || 0), 0) : 0;
+            return cache.approvedSeconds + extra;
+        }
+        return totalSeconds();
+    }
+
+    function getMonthSummary(monthKey) {
+        const month = state.aggregate && state.aggregate.months[monthKey];
+        if (!month) return {
+            totalSeconds: 0, submissions: 0, activeDays: 0, days: {},
+            deliveredSeconds: 0, deliveredSubmissions: 0,
+            pendingSeconds: 0, pendingSubmissions: 0
+        };
+        return {
+            totalSeconds: month.totalSeconds || 0,
+            submissions: month.submissions || 0,
+            activeDays: month.activeDays || 0,
+            deliveredSeconds: month.deliveredSeconds || 0,
+            deliveredSubmissions: month.deliveredSubmissions || 0,
+            pendingSeconds: month.pendingSeconds || 0,
+            pendingSubmissions: month.pendingSubmissions || 0,
+            days: { ...month.days }
+        };
+    }
+
+    function getActivityDays(monthKey, range) {
+        const month = state.aggregate && state.aggregate.months[monthKey];
+        if (!month) return [];
+        let keys = Object.keys(month.days || {}).sort();
+        if (range === '7' || range === '30') {
+            const n = range === '7' ? 7 : 30;
+            const today = localDateKey();
+            const parts = today.split('-').map(Number);
+            const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+            d.setUTCDate(d.getUTCDate() - (n - 1));
+            const cutoff = `${padYear(d.getUTCFullYear())}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+            keys = keys.filter(k => k >= cutoff && k <= today);
+        }
+        return keys.map(dayKey => ({
+            dayKey,
+            seconds: month.days[dayKey].seconds || 0,
+            submissions: month.days[dayKey].submissions || 0
+        }));
+    }
+
+    /** Resolve a named range preset to {from, to, label}. */
+    function resolveRangePreset(preset) {
+        const today = localDateKey();
+        const parts = today.split('-').map(Number);
+        const y = parts[0], m = parts[1], d = parts[2];
+        const pad = (n) => String(n).padStart(2, '0');
+        if (preset === 'today')
+            return { from: today, to: today, label: 'Hôm nay' };
+        if (preset === '7') {
+            const dt = new Date(Date.UTC(y, m - 1, d));
+            dt.setUTCDate(dt.getUTCDate() - 6);
+            const from = `${padYear(dt.getUTCFullYear())}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())}`;
+            return { from, to: today, label: '7 ngày' };
+        }
+        if (preset === 'month') {
+            const from = `${padYear(y)}-${pad(m)}-01`;
+            return { from, to: today, label: 'Tháng này' };
+        }
+        if (preset === 'lastMonth') {
+            const lm = m === 1 ? 12 : m - 1;
+            const ly = m === 1 ? y - 1 : y;
+            const lastDay = new Date(Date.UTC(ly, lm, 0)).getUTCDate();
+            return {
+                from: `${padYear(ly)}-${pad(lm)}-01`,
+                to: `${padYear(ly)}-${pad(lm)}-${pad(lastDay)}`,
+                label: 'Tháng trước'
+            };
+        }
+        // all: from earliest known day or a far past
+        let earliest = today;
+        if (state.aggregate && state.aggregate.months) {
+            for (const month of Object.values(state.aggregate.months)) {
+                for (const dayKey of Object.keys(month.days || {})) {
+                    if (dayKey < earliest) earliest = dayKey;
+                }
+            }
+        }
+        return { from: earliest, to: today, label: 'Tất cả' };
+    }
+
+    function snapshot() {
+        return {
+            projectId: state.projectId,
+            status: state.status,
+            loading: state.loading,
+            lastError: state.lastError,
+            lastRefreshAt: state.lastRefreshAt,
+            cache: state.cache,
+            aggregate: state.aggregate,
+            today: localDateKey(),
+            month: localMonthKey(),
+            todaySeconds: daySeconds(localDateKey()),
+            monthSeconds: monthSeconds(localMonthKey()),
+            totalSeconds: reportedTotalSeconds(),
+            reportSessions: state.cache ? state.cache.reportSessions : null,
+            accessibleSubmissions: state.cache ? state.cache.accessibleSubmissions : 0
+        };
+    }
+
+    function subscribe(fn) {
+        LISTENERS.add(fn);
+        return () => LISTENERS.delete(fn);
+    }
+
+    function init() {
+        ensureProject(modules.config.PROJECT_ID);
+        modules.environment.W.tbWorkDataSnapshot = () => snapshot();
+        modules.environment.W.tbWorkDataRefresh = (force) => refresh({ force: !!force });
+    }
+
+    return {
+        get localDateKey() { return localDateKey; },
+        get localMonthKey() { return localMonthKey; },
+        get isValidDateKey() { return isValidDateKey; },
+        get formatDuration() { return formatDuration; },
+        get formatDurationShort() { return formatDurationShort; },
+        get formatMoney() { return formatMoney; },
+        get moneyFromSeconds() { return moneyFromSeconds; },
+        get ratePerHour() { return ratePerHour; },
+        get classifyRecord() { return classifyRecord; },
+        get submissionEpisodeSeconds() { return submissionEpisodeSeconds; },
+        get refresh() { return refresh; },
+        get refreshAfterSubmit() { return refreshAfterSubmit; },
+        get rangeSeconds() { return rangeSeconds; },
+        get daySeconds() { return daySeconds; },
+        get monthSeconds() { return monthSeconds; },
+        get totalSeconds() { return totalSeconds; },
+        get reportedTotalSeconds() { return reportedTotalSeconds; },
+        get getMonthSummary() { return getMonthSummary; },
+        get getActivityDays() { return getActivityDays; },
+        get resolveRangePreset() { return resolveRangePreset; },
+        get snapshot() { return snapshot; },
+        get subscribe() { return subscribe; },
+        get ensureProject() { return ensureProject; },
+        get isCacheFresh() { return () => isCacheFresh(state.cache); },
+        get state() { return state; },
+        init
+    };
+};
+
 // MODULE: earnings
 /**
  * earnings
@@ -5750,7 +6751,7 @@ factories.controls = function createControls(modules) {
  */
 factories.earnings = function createEarnings(modules) {
     'use strict';
-    const TOTAL_REFRESH_MS = 30000;
+    const TOTAL_REFRESH_MS = 300000; // 5 minutes — matches panel footnote
     const TASK_REFRESH_MS = 1000;
     const TASK_LIST_PAGE_SIZE = 100;
     const SUBMISSION_REQUEST_DELAY_MS = 200;
@@ -5807,281 +6808,340 @@ factories.earnings = function createEarnings(modules) {
         return `${hours} h ${String(minutes).padStart(2, '0')} min`;
     }
 
+    const RANGE_PANEL_ID = 'tb-earnings-range-panel';
+    const RANGE_STYLE_ID = 'tb-earnings-range-style';
+    let selectedPreset = 'lastMonth';
+    let customFrom = '';
+    let customTo = '';
+    let panelOpen = false;
+    let lastComputed = null; // { from, to, label, seconds, submissions, money, at }
+
+    const RANGE_CSS = `
+#tb-earnings-header-display.tbp-earnings-group{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;padding:4px 8px;border:1px solid rgba(71,85,105,.72);border-radius:8px;background:rgba(15,23,42,.85);cursor:pointer;user-select:none}
+#tb-earnings-header-display .tbp-earnings-total{color:#fbbf24;font:700 12px/1.2 system-ui,sans-serif}
+#tb-earnings-header-display .tbp-earnings-period{color:#94a3b8;font:600 11px/1.2 system-ui,sans-serif}
+#tb-earnings-header-display .tbp-earnings-chevron{color:#64748b;font-size:10px;margin-left:2px}
+#tb-earnings-header-display:hover{border-color:#6366f1}
+#tb-earnings-range-panel{position:fixed;z-index:2147483001;width:min(380px,94vw);max-height:85vh;overflow:auto;padding:14px 16px;border-radius:12px;border:1px solid #334155;background:#0b1220;color:#e2e8f0;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 16px 40px rgba(0,0,0,.55)}
+#tb-earnings-range-panel[hidden]{display:none!important}
+#tb-earnings-range-panel *{box-sizing:border-box}
+.tber-title{margin:0 0 12px;font-size:14px;font-weight:700;color:#f1f5f9}
+.tber-presets{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.tber-presets button{appearance:none;border:1px solid #334155;border-radius:999px;background:#1e293b;color:#cbd5e1;font:600 12px/1 system-ui,sans-serif;padding:7px 12px;cursor:pointer}
+.tber-presets button:hover{border-color:#6366f1;color:#e2e8f0}
+.tber-presets button.active{background:#059669;border-color:#10b981;color:#ecfdf5}
+.tber-dates{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.tber-dates label{display:flex;flex-direction:column;gap:4px;font:600 11px/1.2 system-ui,sans-serif;color:#94a3b8}
+.tber-dates input{width:100%;min-height:36px;padding:6px 8px;border:1px solid #334155;border-radius:8px;background:#0f172a;color:#e2e8f0;font:500 13px/1.2 system-ui,sans-serif}
+.tber-calc{display:block;width:100%;min-height:40px;margin-bottom:14px;border:none;border-radius:10px;background:#059669;color:#ecfdf5;font:700 14px/1 system-ui,sans-serif;cursor:pointer}
+.tber-calc:hover{background:#047857}
+.tber-calc:disabled{opacity:.6;cursor:wait}
+.tber-metrics{display:flex;flex-direction:column;gap:8px}
+.tber-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:4px 0;border-bottom:1px dashed #1e293b}
+.tber-row:last-child{border-bottom:none}
+.tber-k{color:#94a3b8;font-size:12px}
+.tber-v{font-weight:700;text-align:right;color:#e2e8f0}
+.tber-v.money{color:#34d399;font-size:16px}
+.tber-foot{margin-top:10px;color:#64748b;font-size:11px}
+#tb-earnings-header-display .tbp-earnings-today,
+#tb-earnings-header-display .tbp-earnings-task{display:none}
+`;
+
+    function ensureRangeStyle() {
+        if (document.getElementById(RANGE_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = RANGE_STYLE_ID;
+        style.textContent = RANGE_CSS;
+        (document.head || document.documentElement).appendChild(style);
+    }
+
+    function isoToInputDate(iso) {
+        // YYYY-MM-DD -> MM/DD/YYYY for display preference; inputs use type=date so keep ISO
+        return iso || '';
+    }
+
     function ensureHeaderDisplays() {
+        ensureRangeStyle();
         const themeToggle = document.querySelector('[data-testid="theme-toggle"]');
         const actionGroup = themeToggle && themeToggle.parentElement
             ? themeToggle.parentElement
             : document.getElementById('tbp-row-fetch');
-        if (!actionGroup)
-            return;
+        if (!actionGroup) return;
         const insertionTarget = themeToggle && themeToggle.parentElement === actionGroup ? themeToggle : null;
         let container = document.getElementById(HEADER_DISPLAY_ID);
         if (!container) {
             container = document.createElement('div');
             container.id = HEADER_DISPLAY_ID;
             container.className = 'tbp-earnings-group';
+            container.title = 'Bấm để mở bảng thu nhập theo khoảng ngày';
+            container.addEventListener('click', (event) => {
+                event.stopPropagation();
+                toggleRangePanel();
+            });
         }
         if (container.parentElement !== actionGroup)
             actionGroup.insertBefore(container, insertionTarget);
         else if (insertionTarget)
             actionGroup.insertBefore(container, insertionTarget);
+
         let total = document.getElementById(TOTAL_DISPLAY_ID);
         if (!total) {
             total = document.createElement('span');
             total.id = TOTAL_DISPLAY_ID;
             total.className = 'tbp-earnings-total';
-            total.textContent = '💰 —';
+            total.textContent = '— đ';
         }
-        if (total.parentElement !== container)
-            container.appendChild(total);
+        if (total.parentElement !== container) container.appendChild(total);
+
+        let period = document.getElementById('tb-earnings-period-label');
+        if (!period) {
+            period = document.createElement('span');
+            period.id = 'tb-earnings-period-label';
+            period.className = 'tbp-earnings-period';
+            period.textContent = 'Tháng trước';
+        }
+        if (period.parentElement !== container) container.appendChild(period);
+
+        let chevron = document.getElementById('tb-earnings-chevron');
+        if (!chevron) {
+            chevron = document.createElement('span');
+            chevron.id = 'tb-earnings-chevron';
+            chevron.className = 'tbp-earnings-chevron';
+            chevron.textContent = '▾';
+            chevron.setAttribute('aria-hidden', 'true');
+        }
+        if (chevron.parentElement !== container) container.appendChild(chevron);
+
+        // Keep legacy nodes for any code still looking them up (hidden via CSS).
         let today = document.getElementById(TODAY_DISPLAY_ID);
         if (!today) {
             today = document.createElement('span');
             today.id = TODAY_DISPLAY_ID;
             today.className = 'tbp-earnings-today';
-            today.textContent = '📅 Hôm nay: —';
         }
-        if (today.parentElement !== container)
-            container.appendChild(today);
+        if (today.parentElement !== container) container.appendChild(today);
         let task = document.getElementById(TASK_DISPLAY_ID);
         if (!task) {
             task = document.createElement('span');
             task.id = TASK_DISPLAY_ID;
             task.className = 'tbp-earnings-task';
-            task.textContent = '🎯 Task: —';
         }
-        if (task.parentElement !== container)
-            container.appendChild(task);
+        if (task.parentElement !== container) container.appendChild(task);
     }
 
-    function localDateKey(date = new Date()) {
-        const pad = value => String(value).padStart(2, '0');
-        const utcPlus7 = new Date(date.getTime() + UTC_PLUS_7_MS);
-        return `${utcPlus7.getUTCFullYear()}-${pad(utcPlus7.getUTCMonth() + 1)}-${pad(utcPlus7.getUTCDate())}`;
+    function positionRangePanel(panel) {
+        const anchor = document.getElementById(HEADER_DISPLAY_ID);
+        if (!anchor || !panel) return;
+        const rect = anchor.getBoundingClientRect();
+        const width = Math.min(380, window.innerWidth * 0.94);
+        let left = rect.right - width;
+        if (left < 8) left = 8;
+        if (left + width > window.innerWidth - 8)
+            left = Math.max(8, window.innerWidth - width - 8);
+        let top = rect.bottom + 8;
+        if (top + 320 > window.innerHeight)
+            top = Math.max(8, rect.top - 8 - Math.min(400, panel.offsetHeight || 320));
+        panel.style.left = left + 'px';
+        panel.style.top = top + 'px';
     }
 
-    function localMonthKey(date = new Date()) {
-        const pad = value => String(value).padStart(2, '0');
-        const utcPlus7 = new Date(date.getTime() + UTC_PLUS_7_MS);
-        return `${utcPlus7.getUTCFullYear()}-${pad(utcPlus7.getUTCMonth() + 1)}`;
+    function ensureRangePanel() {
+        ensureRangeStyle();
+        let panel = document.getElementById(RANGE_PANEL_ID);
+        if (panel) return panel;
+        panel = document.createElement('div');
+        panel.id = RANGE_PANEL_ID;
+        panel.hidden = true;
+        panel.innerHTML = `
+            <h3 class="tber-title">Thu nhập theo khoảng ngày</h3>
+            <div class="tber-presets" role="group" aria-label="Khoảng nhanh">
+                <button type="button" data-preset="today">Hôm nay</button>
+                <button type="button" data-preset="7">7 ngày</button>
+                <button type="button" data-preset="month">Tháng này</button>
+                <button type="button" data-preset="lastMonth" class="active">Tháng trước</button>
+                <button type="button" data-preset="all">Tất cả</button>
+            </div>
+            <div class="tber-dates">
+                <label>TỪ NGÀY
+                    <input type="date" id="tber-from" />
+                </label>
+                <label>ĐẾN NGÀY
+                    <input type="date" id="tber-to" />
+                </label>
+            </div>
+            <button type="button" class="tber-calc" id="tber-calc">Tính toán</button>
+            <div class="tber-metrics">
+                <div class="tber-row"><span class="tber-k">Thu nhập</span><span class="tber-v money" id="tber-money">—</span></div>
+                <div class="tber-row"><span class="tber-k">Giờ cắt</span><span class="tber-v" id="tber-hours">—</span></div>
+                <div class="tber-row"><span class="tber-k">Task delivered</span><span class="tber-v" id="tber-tasks">—</span></div>
+                <div class="tber-row"><span class="tber-k">Submitted / Rework</span><span class="tber-v" id="tber-rework">0 task · ~0 đ</span></div>
+            </div>
+            <div class="tber-foot" id="tber-foot">Chưa tính toán</div>
+        `;
+        document.body.appendChild(panel);
+
+        panel.addEventListener('click', (event) => event.stopPropagation());
+        panel.querySelectorAll('[data-preset]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                selectedPreset = btn.getAttribute('data-preset') || 'lastMonth';
+                panel.querySelectorAll('[data-preset]').forEach(b => b.classList.toggle('active', b === btn));
+                applyPresetToInputs();
+            });
+        });
+        const calcBtn = panel.querySelector('#tber-calc');
+        calcBtn.addEventListener('click', () => { void runRangeCalculation(true); });
+        document.addEventListener('click', () => {
+            if (!panel.hidden) {
+                panel.hidden = true;
+                panelOpen = false;
+            }
+        });
+        applyPresetToInputs();
+        return panel;
     }
 
-    function syncWorkingHoursPeriod(today, month) {
-        const now = new Date();
-        today = today || localDateKey(now);
-        month = month || localMonthKey(now);
-        let changed = false;
-        if (reportTodayDateKey !== today) {
-            reportTodayDateKey = today;
-            reportTodaySeconds = null;
-            reportDataError = '';
-            changed = true;
+    function applyPresetToInputs() {
+        const range = modules.workData.resolveRangePreset(selectedPreset);
+        customFrom = range.from;
+        customTo = range.to;
+        const panel = document.getElementById(RANGE_PANEL_ID);
+        if (!panel) return;
+        const fromInput = panel.querySelector('#tber-from');
+        const toInput = panel.querySelector('#tber-to');
+        if (fromInput) fromInput.value = customFrom;
+        if (toInput) toInput.value = customTo;
+        const period = document.getElementById('tb-earnings-period-label');
+        if (period) period.textContent = range.label;
+    }
+
+    function toggleRangePanel() {
+        const panel = ensureRangePanel();
+        panelOpen = panel.hidden;
+        panel.hidden = !panelOpen;
+        if (panelOpen) {
+            applyPresetToInputs();
+            positionRangePanel(panel);
+            void runRangeCalculation(false);
         }
-        if (reportMonthKey !== month) {
-            reportMonthKey = month;
-            monthSeconds = null;
-            reportDataError = '';
-            changed = true;
+    }
+
+    async function runRangeCalculation(forceRefresh) {
+        const panel = ensureRangePanel();
+        const calcBtn = panel.querySelector('#tber-calc');
+        const fromInput = panel.querySelector('#tber-from');
+        const toInput = panel.querySelector('#tber-to');
+        const from = (fromInput && fromInput.value) || customFrom;
+        const to = (toInput && toInput.value) || customTo;
+        if (calcBtn) {
+            calcBtn.disabled = true;
+            calcBtn.textContent = 'Đang tính…';
         }
-        if (changed)
-            reportDataWarning = '';
-        return `${today}|${month}`;
-    }
-
-    function isMyLabellingReport(report) {
-        if (!report)
-            return false;
-        const reportText = String(report.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        if (reportText.includes('my labelling work'))
-            return true;
-        const headings = report.querySelectorAll('h1, h2, h3, h4, [role="heading"]');
-        return Array.from(headings).some(heading => String(heading.textContent || '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .toLowerCase() === 'my labelling work');
-    }
-
-    function findDirectGridChild(grid, element) {
-        let current = element;
-        while (current && current.parentElement !== grid)
-            current = current.parentElement;
-        return current && current.parentElement === grid ? current : null;
-    }
-
-    function findMyReportGrid(report) {
-        const cards = MY_REPORT_CARD_SELECTORS.map(selector => report.querySelector(selector));
-        if (cards.some(card => !card))
-            return null;
-        let candidate = cards[1].parentElement;
-        while (candidate && candidate !== report) {
-            const directChildren = cards.map(card => findDirectGridChild(candidate, card));
-            if (directChildren.every(Boolean) && new Set(directChildren).size === cards.length)
-                return candidate;
-            candidate = candidate.parentElement;
+        try {
+            if (forceRefresh || !modules.workData.isCacheFresh())
+                await modules.workData.refresh({ force: !!forceRefresh });
+            const stats = modules.workData.rangeSeconds(from, to);
+            // Money + main hours only from Delivered; Submitted/Rework shown separately.
+            const deliveredSeconds = stats.deliveredSeconds || 0;
+            const deliveredCount = stats.deliveredSubmissions || 0;
+            const pendingSeconds = stats.pendingSeconds || 0;
+            const pendingCount = stats.pendingSubmissions || 0;
+            const money = modules.workData.moneyFromSeconds(deliveredSeconds);
+            const pendingMoney = modules.workData.moneyFromSeconds(pendingSeconds);
+            const label = (modules.workData.resolveRangePreset(selectedPreset).from === from
+                && modules.workData.resolveRangePreset(selectedPreset).to === to)
+                ? modules.workData.resolveRangePreset(selectedPreset).label
+                : `${from} → ${to}`;
+            lastComputed = {
+                from, to, label,
+                seconds: deliveredSeconds,
+                submissions: deliveredCount,
+                pendingSeconds, pendingSubmissions: pendingCount, pendingMoney,
+                money, at: Date.now()
+            };
+            const moneyEl = panel.querySelector('#tber-money');
+            const hoursEl = panel.querySelector('#tber-hours');
+            const tasksEl = panel.querySelector('#tber-tasks');
+            const reworkEl = panel.querySelector('#tber-rework');
+            const foot = panel.querySelector('#tber-foot');
+            if (moneyEl) moneyEl.textContent = modules.workData.formatMoney(money);
+            if (hoursEl) {
+                const h = deliveredSeconds / 3600;
+                hoursEl.textContent = `${modules.workData.formatDuration(deliveredSeconds)} (${h.toFixed(2)}h)`;
+            }
+            if (tasksEl) tasksEl.textContent = String(deliveredCount);
+            if (reworkEl) {
+                reworkEl.textContent = `${pendingCount} task · ≈${modules.workData.formatMoney(pendingMoney)}`;
+                reworkEl.title = pendingCount
+                    ? `Submitted/Rework: ${modules.workData.formatDuration(pendingSeconds)} — chưa tính vào thu nhập chính`
+                    : 'Không có task Submitted/Rework trong khoảng này';
+            }
+            if (foot) {
+                const t = new Date(lastComputed.at).toLocaleTimeString('vi-VN');
+                foot.textContent = `Cập nhật ${t} · tự cập nhật mỗi 5 phút`;
+            }
+            // Sync header
+            const totalEl = document.getElementById(TOTAL_DISPLAY_ID);
+            if (totalEl) totalEl.textContent = modules.workData.formatMoney(money);
+            const period = document.getElementById('tb-earnings-period-label');
+            if (period) period.textContent = lastComputed.label;
+            totalSeconds = deliveredSeconds;
+            todaySeconds = modules.workData.daySeconds(modules.workData.localDateKey());
+        } catch (error) {
+            const foot = panel.querySelector('#tber-foot');
+            if (foot) foot.textContent = 'Lỗi: ' + (error && error.message ? error.message : error);
+            modules.logger.console.warn('[Earnings] range calc failed:', error);
+        } finally {
+            if (calcBtn) {
+                calcBtn.disabled = false;
+                calcBtn.textContent = 'Tính toán';
+            }
         }
-        return null;
-    }
-
-    function createWorkingHoursCard(hoursCard) {
-        const card = document.createElement('div');
-        const sourceClassName = typeof hoursCard.className === 'string'
-            ? hoursCard.className
-            : hoursCard.getAttribute('class') || '';
-        card.className = sourceClassName;
-        card.setAttribute('data-testid', 'tb-working-hours-card');
-        card.setAttribute('role', 'group');
-        card.setAttribute('aria-label', 'Working hours this month and today');
-        card.style.cssText = 'position:relative;overflow:hidden;height:100%;'
-            + 'border-top:3px solid var(--tb-brand-blue,#38bdf8);';
-
-        const content = document.createElement('div');
-        content.style.cssText = 'display:flex;flex-direction:column;justify-content:space-between;'
-            + 'gap:6px;min-height:84px;padding-top:2px;';
-        const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;';
-        const title = document.createElement('span');
-        title.textContent = 'WORKING HOURS';
-        title.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'
-            + 'font-size:10px;font-weight:700;letter-spacing:.07em;'
-            + 'color:var(--tb-brand-blue,#0ea5e9);';
-        const clock = document.createElement('span');
-        clock.textContent = '◷';
-        clock.setAttribute('aria-hidden', 'true');
-        clock.style.cssText = 'flex:0 0 auto;font-size:19px;line-height:1;'
-            + 'color:var(--tb-brand-blue,#38bdf8);';
-        header.append(title, clock);
-        content.appendChild(header);
-
-        const addMetric = (labelText, testId, valueColor, valueSize) => {
-            const metric = document.createElement('div');
-            metric.style.cssText = 'display:flex;flex-direction:column;gap:2px;min-width:0;';
-            const label = document.createElement('span');
-            label.textContent = labelText;
-            label.style.cssText = 'font-size:10px;line-height:1.15;'
-                + 'color:var(--muted-foreground,#64748b);';
-            const value = document.createElement('span');
-            value.setAttribute('data-testid', testId);
-            value.textContent = '—';
-            value.style.cssText = `font-size:${valueSize}px;line-height:1.2;font-weight:700;`
-                + `white-space:nowrap;color:${valueColor};`;
-            metric.append(label, value);
-            content.appendChild(metric);
-        };
-        addMetric('Tháng này', 'tb-working-hours-month', 'var(--foreground,inherit)', 15);
-        addMetric('Hôm nay', 'tb-working-hours-today', 'var(--tb-brand-blue,#38bdf8)', 13);
-        card.appendChild(content);
-        return card;
-    }
-
-    function renderMyReportWorkingHours() {
-        const report = document.querySelector(MY_REPORT_SELECTOR);
-        const card = report && report.querySelector(WORKING_HOURS_CARD_SELECTOR);
-        if (!card)
-            return;
-        const month = card.querySelector('[data-testid="tb-working-hours-month"]');
-        const today = card.querySelector('[data-testid="tb-working-hours-today"]');
-        if (month)
-            month.textContent = formatDuration(monthSeconds);
-        if (today)
-            today.textContent = formatDuration(reportTodaySeconds);
-        card.title = [reportDataError, reportDataWarning].filter(Boolean).join('\n');
-    }
-
-    function ensureMyReportWorkingHoursCard() {
-        const now = new Date();
-        const today = localDateKey(now);
-        const month = localMonthKey(now);
-        const periodKey = syncWorkingHoursPeriod(today, month);
-        const report = document.querySelector(MY_REPORT_SELECTOR);
-        if (!isMyLabellingReport(report))
-            return false;
-        const grid = findMyReportGrid(report);
-        if (!grid)
-            return false;
-        const hoursCard = report.querySelector(MY_REPORT_CARD_SELECTORS[1]);
-        const hoursGridChild = findDirectGridChild(grid, hoursCard);
-        if (!hoursGridChild)
-            return false;
-
-        const existingCards = Array.from(report.querySelectorAll(WORKING_HOURS_CARD_SELECTOR));
-        const card = existingCards[0] || createWorkingHoursCard(hoursCard);
-        existingCards.slice(1).forEach(duplicate => duplicate.remove());
-        if (card.parentElement !== grid || card !== hoursGridChild.nextElementSibling)
-            grid.insertBefore(card, hoursGridChild.nextElementSibling);
-        renderMyReportWorkingHours();
-
-        if (started && !updatingTotal && lastReportRefreshPeriod !== periodKey) {
-            lastReportRefreshPeriod = periodKey;
-            void updateMyEarnings();
-        }
-        return true;
-    }
-
-    function submissionDateKey(value) {
-        const timestamp = typeof value === 'number'
-            ? Math.abs(value) < 1e12 ? value * 1000 : value
-            : typeof value === 'string' && value.trim() ? Date.parse(value) : NaN;
-        return Number.isFinite(timestamp) ? localDateKey(new Date(timestamp)) : '';
     }
 
     function renderTodayEarnings() {
-        const currentDate = localDateKey();
-        if (todayDateKey !== currentDate) {
-            todayDateKey = currentDate;
-            todaySeconds = null;
-            todayIsEstimated = false;
-            todayTrackingStartedAt = 0;
-            todayDataError = 'Chưa có thống kê cho ngày hiện tại';
-            lastTodayDataWarning = '';
-        }
+        // Header no longer shows separate today line; values live in range panel.
         const element = document.getElementById(TODAY_DISPLAY_ID);
-        if (!element)
-            return;
-        if (todaySeconds === null) {
-            element.textContent = '📅 Hôm nay: —';
-            element.title = todayDataError || 'Đang tải thống kê theo ngày';
-            if (lastUpdateError)
-                element.title += `\nLỗi cập nhật gần nhất: ${lastUpdateError}`;
-            return;
+        if (!element) return;
+        let amount = 0;
+        if (modules.workData) {
+            const today = modules.workData.localDateKey();
+            const stats = modules.workData.rangeSeconds(today, today);
+            amount = modules.workData.moneyFromSeconds(stats.deliveredSeconds || 0);
+        } else if (typeof todaySeconds === 'number') {
+            amount = (todaySeconds / 3600) * modules.config.EARNINGS_RATE_VND_PER_HOUR;
         }
-        const hours = todaySeconds / 3600;
-        const amount = hours * modules.config.EARNINGS_RATE_VND_PER_HOUR;
         element.textContent = `📅 Hôm nay: ${todayIsEstimated ? '~' : ''}${formatMoney(amount)}`;
-        element.title = `${todayIsEstimated ? 'Tạm tính' : 'Theo dữ liệu ngày'} ${todayDateKey}: ${hours.toFixed(2)}h (${todaySeconds.toFixed(0)} giây)`;
-        if (todayIsEstimated && todayTrackingStartedAt) {
-            const startedAt = new Date(todayTrackingStartedAt);
-            const time = startedAt.toLocaleTimeString('vi-VN', {
-                hour: '2-digit',
-                minute: '2-digit',
-                timeZone: 'Asia/Ho_Chi_Minh'
-            });
-            element.title += `\nTheo dõi từ ${time}; không gồm dữ liệu trước thời điểm này.`;
-        }
-        if (todayDataError)
-            element.title += `\n${todayDataError}`;
-        if (lastUpdateError)
-            element.title += `\nLỗi cập nhật gần nhất: ${lastUpdateError}`;
     }
 
     function renderTotalEarnings() {
         ensureHeaderDisplays();
         const element = document.getElementById(TOTAL_DISPLAY_ID);
-        if (element) {
-            if (totalSeconds === null) {
-                element.textContent = '💰 —';
-                element.title = lastUpdateError ? `Không cập nhật được: ${lastUpdateError}` : 'Đang tải thống kê thu nhập';
-            }
-            else {
-                const hours = totalSeconds / 3600;
-                const amount = hours * modules.config.EARNINGS_RATE_VND_PER_HOUR;
-                element.textContent = `💰 ${formatMoney(amount)}`;
-                element.title = `Tổng thời gian: ${hours.toFixed(2)}h (${totalSeconds.toFixed(0)} giây)`;
-                if (lastUpdateError)
-                    element.title += `\nLỗi cập nhật gần nhất: ${lastUpdateError}`;
-            }
+        if (!element) return;
+        if (lastComputed) {
+            element.textContent = formatMoney(lastComputed.money);
+            const period = document.getElementById('tb-earnings-period-label');
+            if (period) period.textContent = lastComputed.label;
+        } else if (typeof totalSeconds === 'number' && Number.isFinite(totalSeconds)) {
+            element.textContent = formatMoney((totalSeconds / 3600) * modules.config.EARNINGS_RATE_VND_PER_HOUR);
+        } else {
+            element.textContent = '— đ';
         }
         renderTodayEarnings();
     }
+
+    function ensureMyReportWorkingHoursCard() {
+        // WORKING HOURS card in My report retired; use Working time tab + earnings panel.
+        try {
+            const report = document.querySelector(MY_REPORT_SELECTOR);
+            if (report) {
+                for (const card of report.querySelectorAll(WORKING_HOURS_CARD_SELECTOR))
+                    card.remove();
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function renderMyReportWorkingHours() { /* no-op */ }
 
     function readRecordedDuration() {
         const timelineElement = document.querySelector(TIMELINE_SELECTOR);
@@ -6460,129 +7520,76 @@ factories.earnings = function createEarnings(modules) {
         if (updatingTotal)
             return false;
         updatingTotal = true;
-        const startedAt = new Date();
-        lastReportRefreshPeriod = syncWorkingHoursPeriod(localDateKey(startedAt), localMonthKey(startedAt));
-        let backgroundJobStarted = false;
         try {
-            modules.runtime.bgBegin();
-            backgroundJobStarted = true;
-            const candidate = modules.auth.findToken() || modules.auth.findToken(true);
-            if (!candidate || !candidate.token)
-                throw new Error('Chưa tìm được phiên đăng nhập Tbrain');
-            const [statsData, extraData] = await Promise.all([
-                getJson(modules.config.STATS_API_URL, candidate.token),
-                getJson(modules.config.EXTRA_HOURS_API_URL, candidate.token)
-            ]);
-            if (!statsData || typeof statsData !== 'object' || Array.isArray(statsData))
-                throw new Error('Dữ liệu my-stats không đúng định dạng');
-            if (!Array.isArray(extraData))
-                throw new Error('Dữ liệu extra-hours không đúng định dạng');
-            const statsSeconds = readNonNegativeSeconds(statsData.approvedSeconds, 'approvedSeconds');
-            const extraSeconds = extraData.reduce((total, item, index) => {
-                if (!item || typeof item !== 'object' || Array.isArray(item))
-                    throw new Error(`extra-hours[${index}] không hợp lệ`);
-                return total + readNonNegativeSeconds(item.seconds, `extra-hours[${index}].seconds`);
-            }, 0);
-            totalSeconds = statsSeconds + extraSeconds;
-            lastUpdateError = '';
-            const periodReadAt = new Date();
-            const today = localDateKey(periodReadAt);
-            const month = localMonthKey(periodReadAt);
-            const periodKey = syncWorkingHoursPeriod(today, month);
-            lastReportRefreshPeriod = periodKey;
-            todayDateKey = today;
-            const localTracking = updateDailyTracking(statsSeconds, extraSeconds, today);
-            let submissionPeriodSeconds = null;
-            let submissionsReadError = '';
-            let extraTodaySeconds = null;
-            let extraMonthSeconds = null;
-            let extraReadError = '';
-            let reportTodayExtra = { seconds: 0, hasUndatedRecords: false };
-            let reportMonthExtra = { seconds: 0, hasUndatedRecords: false };
-            try {
-                submissionPeriodSeconds = await readSubmissionSecondsByPeriod(candidate.token, today, month);
+            const ok = await modules.workData.refresh({ force: false });
+            const snap = modules.workData.snapshot();
+            todayDateKey = snap.today;
+            totalSeconds = snap.totalSeconds;
+            todaySeconds = snap.todaySeconds;
+            reportTodaySeconds = snap.todaySeconds;
+            monthSeconds = snap.monthSeconds;
+            todayIsEstimated = false;
+            todayDataError = '';
+            reportDataError = snap.lastError || '';
+            lastUpdateError = snap.lastError || '';
+            // Keep range panel / header in sync with default preset
+            function applyStatsToLastComputed(from, to, label, stats) {
+                const deliveredSeconds = stats.deliveredSeconds || 0;
+                const deliveredCount = stats.deliveredSubmissions || 0;
+                const pendingSeconds = stats.pendingSeconds || 0;
+                const pendingCount = stats.pendingSubmissions || 0;
+                return {
+                    from, to, label,
+                    seconds: deliveredSeconds,
+                    submissions: deliveredCount,
+                    pendingSeconds, pendingSubmissions: pendingCount,
+                    pendingMoney: modules.workData.moneyFromSeconds(pendingSeconds),
+                    money: modules.workData.moneyFromSeconds(deliveredSeconds),
+                    at: Date.now()
+                };
             }
-            catch (error) {
-                submissionsReadError = error && error.message ? error.message : String(error);
+            if (!lastComputed) {
+                const preset = modules.workData.resolveRangePreset(selectedPreset);
+                const stats = modules.workData.rangeSeconds(preset.from, preset.to);
+                lastComputed = applyStatsToLastComputed(preset.from, preset.to, preset.label, stats);
+            } else {
+                const stats = modules.workData.rangeSeconds(lastComputed.from, lastComputed.to);
+                lastComputed = applyStatsToLastComputed(
+                    lastComputed.from, lastComputed.to, lastComputed.label, stats);
             }
-            try {
-                extraTodaySeconds = readTodayExtraSeconds(extraData, today);
-            }
-            catch (error) {
-                extraTodaySeconds = null;
-                extraReadError = error && error.message ? error.message : String(error);
-            }
-            try {
-                extraMonthSeconds = readMonthExtraSeconds(extraData, month);
-            }
-            catch (error) {
-                extraMonthSeconds = null;
-                extraReadError = extraReadError || (error && error.message ? error.message : String(error));
-            }
-            try {
-                reportTodayExtra = readDatedExtraSecondsForPeriod(extraData, itemDate => itemDate === today);
-                reportMonthExtra = readDatedExtraSecondsForPeriod(extraData, itemDate => itemDate.slice(0, 7) === month);
-            }
-            catch (error) {
-                reportTodayExtra = { seconds: 0, hasUndatedRecords: true };
-                reportMonthExtra = { seconds: 0, hasUndatedRecords: true };
-                extraReadError = extraReadError || (error && error.message ? error.message : String(error));
-            }
-            todayTrackingStartedAt = localTracking.trackingStartedAt;
-            if (submissionPeriodSeconds !== null) {
-                todaySeconds = submissionPeriodSeconds.todaySeconds + (extraTodaySeconds === null ? 0 : extraTodaySeconds);
-                todayIsEstimated = false;
-                todayDataError = extraTodaySeconds === null
-                    ? `extra-hours không có ngày để lọc; khoản này chưa được cộng vào tổng ngày${extraReadError ? ` (${extraReadError})` : ''}`
-                    : '';
-                if (todayDataError && todayDataError !== lastTodayDataWarning)
-                    modules.logger.console.info('[Earnings]', todayDataError);
-                lastTodayDataWarning = todayDataError;
-                const completedAt = new Date();
-                const currentToday = localDateKey(completedAt);
-                const currentMonth = localMonthKey(completedAt);
-                syncWorkingHoursPeriod(currentToday, currentMonth);
-                if (today === currentToday && reportTodayDateKey === today)
-                    reportTodaySeconds = submissionPeriodSeconds.todaySeconds
-                        + (extraTodaySeconds === null ? reportTodayExtra.seconds : extraTodaySeconds);
-                if (month === currentMonth && reportMonthKey === month)
-                    monthSeconds = submissionPeriodSeconds.monthSeconds
-                        + (extraMonthSeconds === null ? reportMonthExtra.seconds : extraMonthSeconds);
-                reportDataError = '';
-                const hasUndatedExtra = reportTodayExtra.hasUndatedRecords || reportMonthExtra.hasUndatedRecords;
-                reportDataWarning = hasUndatedExtra
-                    ? 'Một số extra-hours không có ngày hợp lệ nên không được cộng vào WORKING HOURS.'
-                    : '';
-                if (reportDataWarning && reportDataWarning !== lastExtraDateWarning)
-                    modules.logger.console.warn('[Earnings]', reportDataWarning);
-                lastExtraDateWarning = reportDataWarning;
-            }
-            else {
-                todaySeconds = localTracking.approvedSeconds + localTracking.extraSeconds;
-                todayIsEstimated = true;
-                todayDataError = `Không đọc được submissions; dùng bộ đếm cục bộ: ${submissionsReadError}`;
-                if (todayDataError !== lastTodayDataWarning)
-                    modules.logger.console.warn('[Earnings]', todayDataError);
-                lastTodayDataWarning = todayDataError;
-                reportDataError = `Không đọc được submissions cho WORKING HOURS: ${submissionsReadError}`;
-            }
+            totalSeconds = lastComputed.seconds;
             renderTotalEarnings();
-            renderMyReportWorkingHours();
-            return true;
-        }
-        catch (error) {
-            const previousError = lastUpdateError;
+            // Refresh open panel metrics
+            const panel = document.getElementById(RANGE_PANEL_ID);
+            if (panel && !panel.hidden && lastComputed) {
+                const moneyEl = panel.querySelector('#tber-money');
+                const hoursEl = panel.querySelector('#tber-hours');
+                const tasksEl = panel.querySelector('#tber-tasks');
+                const reworkEl = panel.querySelector('#tber-rework');
+                const foot = panel.querySelector('#tber-foot');
+                if (moneyEl) moneyEl.textContent = modules.workData.formatMoney(lastComputed.money);
+                if (hoursEl) {
+                    const h = (lastComputed.seconds || 0) / 3600;
+                    hoursEl.textContent = `${modules.workData.formatDuration(lastComputed.seconds)} (${h.toFixed(2)}h)`;
+                }
+                if (tasksEl) tasksEl.textContent = String(lastComputed.submissions);
+                if (reworkEl) {
+                    const pc = lastComputed.pendingSubmissions || 0;
+                    const pm = lastComputed.pendingMoney || 0;
+                    reworkEl.textContent = `${pc} task · ≈${modules.workData.formatMoney(pm)}`;
+                }
+                if (foot) {
+                    const t = new Date(lastComputed.at).toLocaleTimeString('vi-VN');
+                    foot.textContent = `Cập nhật ${t} · tự cập nhật mỗi 5 phút`;
+                }
+            }
+            return ok;
+        } catch (error) {
             lastUpdateError = error && error.message ? error.message : String(error);
-            reportDataError = `Không cập nhật được WORKING HOURS: ${lastUpdateError}`;
             renderTotalEarnings();
-            renderMyReportWorkingHours();
-            if (lastUpdateError !== previousError)
-                modules.logger.console.error('[Earnings] Lỗi cập nhật thu nhập:', error);
+            modules.logger.console.error('[Earnings] Lỗi cập nhật thu nhập:', error);
             return false;
-        }
-        finally {
-            if (backgroundJobStarted)
-                modules.runtime.bgEnd();
+        } finally {
             updatingTotal = false;
         }
     }
@@ -6607,6 +7614,49 @@ factories.earnings = function createEarnings(modules) {
         renderTotalEarnings();
         void refreshTotalLoop();
         refreshTaskLoop();
+        if (modules.workData && typeof modules.workData.subscribe === 'function') {
+            modules.workData.subscribe(() => {
+                // After submit (or any workData refresh): recompute header numbers from cache.
+                if (!lastComputed) return;
+                try {
+                    const stats = modules.workData.rangeSeconds(lastComputed.from, lastComputed.to);
+                    const deliveredSeconds = stats.deliveredSeconds || 0;
+                    const deliveredCount = stats.deliveredSubmissions || 0;
+                    const pendingSeconds = stats.pendingSeconds || 0;
+                    const pendingCount = stats.pendingSubmissions || 0;
+                    lastComputed.seconds = deliveredSeconds;
+                    lastComputed.submissions = deliveredCount;
+                    lastComputed.pendingSeconds = pendingSeconds;
+                    lastComputed.pendingSubmissions = pendingCount;
+                    lastComputed.pendingMoney = modules.workData.moneyFromSeconds(pendingSeconds);
+                    lastComputed.money = modules.workData.moneyFromSeconds(deliveredSeconds);
+                    lastComputed.at = Date.now();
+                    totalSeconds = deliveredSeconds;
+                    renderTotalEarnings();
+                    const panel = document.getElementById(RANGE_PANEL_ID);
+                    if (panel && !panel.hidden) {
+                        const moneyEl = panel.querySelector('#tber-money');
+                        const hoursEl = panel.querySelector('#tber-hours');
+                        const tasksEl = panel.querySelector('#tber-tasks');
+                        const reworkEl = panel.querySelector('#tber-rework');
+                        const foot = panel.querySelector('#tber-foot');
+                        if (moneyEl) moneyEl.textContent = modules.workData.formatMoney(lastComputed.money);
+                        if (hoursEl) {
+                            const h = deliveredSeconds / 3600;
+                            hoursEl.textContent = `${modules.workData.formatDuration(deliveredSeconds)} (${h.toFixed(2)}h)`;
+                        }
+                        if (tasksEl) tasksEl.textContent = String(deliveredCount);
+                        if (reworkEl) {
+                            reworkEl.textContent = `${pendingCount} task · ≈${modules.workData.formatMoney(lastComputed.pendingMoney)}`;
+                        }
+                        if (foot) {
+                            const t = new Date(lastComputed.at).toLocaleTimeString('vi-VN');
+                            foot.textContent = `Cập nhật ${t} · vừa làm mới sau submit`;
+                        }
+                    }
+                } catch (_) {}
+            });
+        }
     }
 
     return {
@@ -6621,7 +7671,9 @@ factories.earnings = function createEarnings(modules) {
         get readSubmissionSecondsByPeriod() { return readSubmissionSecondsByPeriod; },
         get renderMyReportWorkingHours() { return renderMyReportWorkingHours; },
         get ensureMyReportWorkingHoursCard() { return ensureMyReportWorkingHoursCard; },
-        get start() { return start; }
+        get start() { return start; },
+        get renderTotalEarnings() { return renderTotalEarnings; },
+        get updateMyEarnings() { return updateMyEarnings; }
     };
 };
 
@@ -6698,6 +7750,17 @@ factories.workingTime = function createWorkingTime(modules) {
 .tbwt-status{min-height:18px;margin-top:10px;color:var(--tb-fg-muted,#9ca3af);font-size:10px}
 .tbwt-retry{margin-top:5px}
 .tbwt-retry[hidden]{display:none!important}
+.tbwt-earnings-row{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 14px}
+.tbwt-earn-card{flex:1 1 140px;min-width:0;padding:12px 14px;border:1px solid var(--tb-border,#374151);border-radius:10px;background:rgba(15,23,42,.55)}
+.tbwt-earn-card .tbwt-kpi-label{display:block;margin-bottom:4px;color:var(--tb-fg-muted,#94a3b8);font-size:10px;font-weight:700;letter-spacing:.06em}
+.tbwt-earn-card .tbwt-value{display:block;color:#34d399;font-size:18px;font-weight:750}
+.tbwt-earn-card .tbwt-kpi-detail{display:block;margin-top:3px;color:var(--tb-fg-muted,#64748b);font-size:11px}
+.tbwt-presets{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 12px}
+.tbwt-presets button{appearance:none;border:1px solid #334155;border-radius:999px;background:#1e293b;color:#cbd5e1;font:600 12px/1 system-ui,sans-serif;padding:7px 12px;cursor:pointer}
+.tbwt-presets button:hover{border-color:#6366f1;color:#e2e8f0}
+.tbwt-presets button.active,.tbwt-presets button[aria-pressed="true"]{background:#059669;border-color:#10b981;color:#ecfdf5}
+.tbwt-range-meta{margin:0 0 10px;color:var(--tb-fg-muted,#94a3b8);font-size:12px}
+.tbwt-range-meta strong{color:#e2e8f0;font-weight:700}
 .tbwt-settings{margin-top:14px;padding:14px;border:1px solid var(--tb-border,#374151);border-radius:10px;background:var(--tbwt-surface,rgba(17,24,39,.86))}
 .tbwt-settings[hidden]{display:none!important}
 .tbwt-settings-title{margin:0 0 12px;color:var(--tb-fg,#f9fafb);font-size:13px;font-weight:700}
@@ -6725,6 +7788,10 @@ factories.workingTime = function createWorkingTime(modules) {
         active: false,
         selectedMonth: '',
         selectedRange: DEFAULTS.recentDaysRange,
+        selectedPreset: 'month',
+        presetFrom: '',
+        presetTo: '',
+        presetLabel: 'Tháng này',
         settings: Object.assign({}, DEFAULTS),
         settingsDraft: null,
         settingsOpen: false,
@@ -7095,8 +8162,20 @@ factories.workingTime = function createWorkingTime(modules) {
         state.settingsDraft = null;
         state.settingsOpen = false;
         state.settingsError = '';
-        state.cache = projectId ? loadWorkingTimeCache(projectId) : null;
-        state.aggregate = state.cache ? aggregateWorkingTimeData(state.cache) : { months: Object.create(null) };
+        if (projectId) {
+            modules.workData.ensureProject(projectId);
+            const snap = modules.workData.snapshot();
+            if (snap.cache) {
+                state.cache = snap.cache;
+                state.aggregate = snap.aggregate || { months: Object.create(null) };
+            } else {
+                state.cache = loadWorkingTimeCache(projectId);
+                state.aggregate = state.cache ? aggregateWorkingTimeData(state.cache) : { months: Object.create(null) };
+            }
+        } else {
+            state.cache = null;
+            state.aggregate = { months: Object.create(null) };
+        }
         state.dataLoaded = !!state.cache;
         state.reportSessions = state.cache ? state.cache.reportSessions : null;
         state.accessibleSubmissions = state.cache ? state.cache.accessibleSubmissions : 0;
@@ -7599,7 +8678,7 @@ factories.workingTime = function createWorkingTime(modules) {
         view.hidden = true;
 
         const header = createElement('div', 'tbwt-header');
-        header.appendChild(createElement('h2', 'tbwt-title', 'WORKING TIME'));
+        header.appendChild(createElement('h2', 'tbwt-title', 'Thời gian làm việc'));
         const controls = createElement('div', 'tbwt-controls');
         controls.setAttribute('data-tbwt-role', 'controls');
         controls.appendChild(createActionButton('‹', 'previous-month', 'Previous month'));
@@ -7607,8 +8686,8 @@ factories.workingTime = function createWorkingTime(modules) {
         monthLabel.setAttribute('data-tbwt-role', 'month-heading');
         controls.appendChild(monthLabel);
         controls.appendChild(createActionButton('›', 'next-month', 'Next month'));
-        controls.appendChild(createActionButton('Refresh', 'refresh', 'Refresh working-time data'));
-        const settingsButton = createActionButton('Settings', 'settings', 'Open working-time settings');
+        controls.appendChild(createActionButton('Làm mới', 'refresh', 'Làm mới dữ liệu thời gian làm việc'));
+        const settingsButton = createActionButton('Cài đặt', 'settings', 'Mở cài đặt thời gian làm việc');
         settingsButton.setAttribute('aria-controls', 'tbwt-settings-panel');
         settingsButton.setAttribute('aria-expanded', 'false');
         controls.appendChild(settingsButton);
@@ -7627,15 +8706,54 @@ factories.workingTime = function createWorkingTime(modules) {
             card.append(label, value, detail);
             kpis.appendChild(card);
         };
-        addKpi('today', 'TODAY', '');
-        addKpi('month', 'THIS MONTH', '');
-        addKpi('active-days', 'ACTIVE DAYS', '');
-        addKpi('average', 'AVG / ACTIVE DAY', '');
+        addKpi('today', 'HÔM NAY', '');
+        addKpi('month', 'THÁNG NÀY', '');
+        addKpi('active-days', 'NGÀY CÓ GIỜ', '');
+        addKpi('average', 'TB / NGÀY CÓ GIỜ', '');
         view.appendChild(kpis);
+
+        // Earnings summary strip (mirrors earnings range panel metrics)
+        const earnRow = createElement('div', 'tbwt-earnings-row');
+        const makeEarn = (key, label) => {
+            const card = createElement('div', 'tbwt-earn-card');
+            card.appendChild(createElement('span', 'tbwt-kpi-label', label));
+            const value = createElement('span', 'tbwt-value', '—');
+            value.setAttribute('data-tbwt-role', key + '-value');
+            card.appendChild(value);
+            const detail = createElement('span', 'tbwt-kpi-detail', '');
+            detail.setAttribute('data-tbwt-role', key + '-detail');
+            card.appendChild(detail);
+            earnRow.appendChild(card);
+        };
+        makeEarn('income-month', 'THU NHẬP THÁNG');
+        makeEarn('income-today', 'THU NHẬP HÔM NAY');
+        makeEarn('tasks-month', 'TASK DELIVERED');
+        view.appendChild(earnRow);
+
+        // Quick range presets (same vocabulary as earnings panel)
+        const presets = createElement('div', 'tbwt-presets');
+        presets.setAttribute('role', 'group');
+        presets.setAttribute('aria-label', 'Khoảng nhanh');
+        presets.setAttribute('data-tbwt-role', 'presets');
+        for (const [id, label] of [
+            ['today', 'Hôm nay'], ['7', '7 ngày'], ['month', 'Tháng này'],
+            ['lastMonth', 'Tháng trước'], ['all', 'Tất cả']
+        ]) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = label;
+            btn.setAttribute('data-tbwt-action', 'preset');
+            btn.setAttribute('data-tbwt-preset', id);
+            presets.appendChild(btn);
+        }
+        view.appendChild(presets);
+        const rangeMeta = createElement('div', 'tbwt-range-meta');
+        rangeMeta.setAttribute('data-tbwt-role', 'range-meta');
+        view.appendChild(rangeMeta);
 
         const target = createElement('section', 'tbwt-target');
         const targetHead = createElement('div', 'tbwt-target-head');
-        targetHead.appendChild(createElement('h3', 'tbwt-section-title', 'MONTHLY TARGET'));
+        targetHead.appendChild(createElement('h3', 'tbwt-section-title', 'MỤC TIÊU THÁNG'));
         const targetSummary = createElement('span', 'tbwt-target-summary', '—');
         targetSummary.setAttribute('data-tbwt-role', 'target-summary');
         targetHead.appendChild(targetSummary);
@@ -7662,7 +8780,7 @@ factories.workingTime = function createWorkingTime(modules) {
 
         const activity = createElement('section', 'tbwt-activity');
         const activityHead = createElement('div', 'tbwt-activity-head');
-        const activityHeading = createElement('h3', 'tbwt-section-title', 'DAILY ACTIVITY');
+        const activityHeading = createElement('h3', 'tbwt-section-title', 'HOẠT ĐỘNG THEO NGÀY');
         activityHead.appendChild(activityHeading);
         const activitySummary = createElement('span', 'tbwt-activity-summary');
         activitySummary.setAttribute('data-tbwt-role', 'activity-summary');
@@ -7670,7 +8788,7 @@ factories.workingTime = function createWorkingTime(modules) {
         const filters = createElement('div', 'tbwt-filters');
         filters.setAttribute('role', 'group');
         filters.setAttribute('aria-label', 'Daily activity range');
-        for (const [range, text] of [['7', '7D'], ['30', '30D'], ['all', 'ALL']]) {
+        for (const [range, text] of [['7', '7 ngày'], ['30', '30 ngày'], ['all', 'Tất cả']]) {
             const button = createActionButton(text, 'range', `Show ${text} activity`);
             button.setAttribute('data-tbwt-range', range);
             button.setAttribute('aria-pressed', 'false');
@@ -7699,7 +8817,7 @@ factories.workingTime = function createWorkingTime(modules) {
         settings.setAttribute('aria-modal', 'false');
         settings.setAttribute('aria-labelledby', 'tbwt-settings-title');
         settings.hidden = true;
-        settings.appendChild(createElement('h3', 'tbwt-settings-title', 'Working-time settings'));
+        settings.appendChild(createElement('h3', 'tbwt-settings-title', 'Cài đặt thời gian làm việc'));
         const settingsGrid = createElement('div', 'tbwt-settings-grid');
         const addSettingsField = (id, labelText, type, max) => {
             const label = createElement('label', 'tbwt-settings-field', labelText);
@@ -7718,10 +8836,10 @@ factories.workingTime = function createWorkingTime(modules) {
             settingsGrid.appendChild(label);
             return input;
         };
-        addSettingsField('tbwt-daily-target', 'Daily target hours', 'number', 24);
-        addSettingsField('tbwt-monthly-target', 'Monthly target hours', 'number', 744);
-        const rangeSelect = addSettingsField('tbwt-default-range', 'Default activity range', 'select');
-        for (const [value, text] of [['7', '7 days'], ['30', '30 days'], ['all', 'All days']]) {
+        addSettingsField('tbwt-daily-target', 'Mục tiêu giờ / ngày', 'number', 24);
+        addSettingsField('tbwt-monthly-target', 'Mục tiêu giờ / tháng', 'number', 744);
+        const rangeSelect = addSettingsField('tbwt-default-range', 'Khoảng hoạt động mặc định', 'select');
+        for (const [value, text] of [['7', '7 ngày'], ['30', '30 ngày'], ['all', 'Tất cả']]) {
             const option = createElement('option', '', text);
             option.value = value;
             rangeSelect.appendChild(option);
@@ -7733,9 +8851,9 @@ factories.workingTime = function createWorkingTime(modules) {
         settings.appendChild(settingsError);
         const settingsActions = createElement('div', 'tbwt-settings-actions');
         settingsActions.append(
-            createActionButton('Save', 'settings-save'),
-            createActionButton('Cancel', 'settings-cancel'),
-            createActionButton('Reset defaults', 'settings-reset')
+            createActionButton('Lưu', 'settings-save'),
+            createActionButton('Huỷ', 'settings-cancel'),
+            createActionButton('Mặc định', 'settings-reset')
         );
         settings.appendChild(settingsActions);
         view.appendChild(settings);
@@ -7756,8 +8874,8 @@ factories.workingTime = function createWorkingTime(modules) {
 
     function monthLabel(monthKey) {
         const match = String(monthKey || '').match(/^(\d{4})-(\d{2})$/);
-        const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
-            'July', 'August', 'September', 'October', 'November', 'December'];
+        const monthNames = ['Tháng 1', 'Tháng 2', 'Tháng 3', 'Tháng 4', 'Tháng 5', 'Tháng 6',
+            'Tháng 7', 'Tháng 8', 'Tháng 9', 'Tháng 10', 'Tháng 11', 'Tháng 12'];
         if (!match)
             return 'Current month';
         const month = Number(match[2]);
@@ -7931,7 +9049,77 @@ factories.workingTime = function createWorkingTime(modules) {
             averageValue.textContent = hasData ? formatDuration(averageSeconds) : '—';
         const averageDetail = textFor(view, 'average-detail');
         if (averageDetail)
-            averageDetail.textContent = hasData ? 'per active day' : '';
+            averageDetail.textContent = hasData ? 'mỗi ngày có giờ' : '';
+
+        // Earnings strip from workData (same numbers as the header panel)
+        const rate = modules.workData.ratePerHour();
+        const money = sec => modules.workData.moneyFromSeconds(sec);
+        const fmtMoney = modules.workData.formatMoney;
+        const monthDeliveredSec = selectedMonthSummary.deliveredSeconds != null
+            ? selectedMonthSummary.deliveredSeconds
+            : selectedMonthSummary.totalSeconds;
+        const monthDeliveredTasks = selectedMonthSummary.deliveredSubmissions != null
+            ? selectedMonthSummary.deliveredSubmissions
+            : selectedMonthSummary.submissions;
+        const todayDeliveredSec = (todaySummary.deliveredSeconds != null)
+            ? todaySummary.deliveredSeconds
+            : todaySummary.seconds;
+        const incomeMonth = textFor(view, 'income-month-value');
+        if (incomeMonth)
+            incomeMonth.textContent = hasData ? fmtMoney(money(monthDeliveredSec)) : '—';
+        const incomeMonthDetail = textFor(view, 'income-month-detail');
+        if (incomeMonthDetail)
+            incomeMonthDetail.textContent = hasData
+                ? `${formatDuration(monthDeliveredSec)} delivered · ${rate.toLocaleString('vi-VN')} đ/h`
+                : '';
+        const incomeToday = textFor(view, 'income-today-value');
+        if (incomeToday)
+            incomeToday.textContent = hasData ? fmtMoney(money(todayDeliveredSec)) : '—';
+        const incomeTodayDetail = textFor(view, 'income-today-detail');
+        if (incomeTodayDetail)
+            incomeTodayDetail.textContent = hasData ? formatDuration(todayDeliveredSec) + ' delivered' : '';
+        const tasksMonth = textFor(view, 'tasks-month-value');
+        if (tasksMonth)
+            tasksMonth.textContent = hasData ? String(monthDeliveredTasks) : '—';
+        const tasksMonthDetail = textFor(view, 'tasks-month-detail');
+        if (tasksMonthDetail)
+            tasksMonthDetail.textContent = hasData ? 'task delivered trong tháng chọn' : '';
+
+        // Preset pills active state + range meta
+        const preset = state.selectedPreset || 'month';
+        for (const btn of view.querySelectorAll('[data-tbwt-action="preset"]')) {
+            const id = btn.getAttribute('data-tbwt-preset');
+            const on = id === preset;
+            btn.classList.toggle('active', on);
+            btn.setAttribute('aria-pressed', String(on));
+        }
+        const rangeMeta = textFor(view, 'range-meta');
+        if (rangeMeta) {
+            if (!state.presetFrom || !state.presetTo) {
+                const resolved = modules.workData.resolveRangePreset(preset);
+                state.presetFrom = resolved.from;
+                state.presetTo = resolved.to;
+                state.presetLabel = resolved.label;
+            }
+            const stats = modules.workData.rangeSeconds(state.presetFrom, state.presetTo);
+            const paidSec = stats.deliveredSeconds != null ? stats.deliveredSeconds : stats.seconds;
+            rangeMeta.innerHTML = hasData
+                ? `<strong>${state.presetLabel || preset}</strong>: ${state.presetFrom} → ${state.presetTo}`
+                    + ` · ${formatDuration(paidSec)} · ${fmtMoney(money(paidSec))}`
+                    + ` · ${stats.submissions} task`
+                : 'Chưa có dữ liệu — bấm Làm mới';
+        }
+
+        // Localize a few remaining English KPI labels dynamically
+        const monthKpiLabelLive = textFor(view, 'month-label');
+        if (monthKpiLabelLive)
+            monthKpiLabelLive.textContent = state.selectedMonth === currentMonth ? 'THÁNG NÀY' : 'THÁNG ĐÃ CHỌN';
+        const todayDetailLive = textFor(view, 'today-detail');
+        if (todayDetailLive && hasData)
+            todayDetailLive.textContent = `${todayKey} · mục tiêu ${formatTargetHours(state.settings.dailyTargetHours)} h/ngày`;
+        const activeDaysDetailLive = textFor(view, 'active-days-detail');
+        if (activeDaysDetailLive && hasData)
+            activeDaysDetailLive.textContent = 'ngày có thời gian làm việc';
 
         const targetSummary = textFor(view, 'target-summary');
         const targetStatus = textFor(view, 'target-status');
@@ -8034,7 +9222,7 @@ factories.workingTime = function createWorkingTime(modules) {
         const refreshButton = view.querySelector('[data-tbwt-action="refresh"]');
         if (refreshButton) {
             refreshButton.disabled = state.isWorkingTimeLoading;
-            refreshButton.textContent = state.isWorkingTimeLoading ? 'Refreshing…' : 'Refresh';
+            refreshButton.textContent = state.isWorkingTimeLoading ? 'Đang làm mới…' : 'Làm mới';
         }
         const settingsButton = view.querySelector('[data-tbwt-action="settings"]');
         if (settingsButton)
@@ -8271,8 +9459,19 @@ factories.workingTime = function createWorkingTime(modules) {
                 state.queuedProjectId = projectId;
             return state.loadingPromise || false;
         }
-        if (!force && isWorkingTimeCacheFresh(state.cache))
+        modules.workData.ensureProject(projectId);
+        if (!force && modules.workData.isCacheFresh()) {
+            const snap = modules.workData.snapshot();
+            state.cache = snap.cache;
+            state.aggregate = snap.aggregate;
+            state.dataLoaded = !!snap.cache;
+            state.reportSessions = snap.reportSessions;
+            state.accessibleSubmissions = snap.accessibleSubmissions;
+            state.status = 'updated';
+            state.lastError = '';
+            renderWorkingTimeDashboard();
             return true;
+        }
         state.isWorkingTimeLoading = true;
         state.loadingProjectId = projectId;
         state.status = state.dataLoaded ? 'refreshing' : 'loading';
@@ -8280,19 +9479,18 @@ factories.workingTime = function createWorkingTime(modules) {
         renderWorkingTimeDashboard();
         const request = (async () => {
             try {
-                const fetched = await fetchWorkingTimeData(projectId);
-                fetched.updatedAt = Date.now();
-                const saved = saveWorkingTimeCache(projectId, fetched);
+                const ok = await modules.workData.refresh({ force: !!force, projectId });
+                const snap = modules.workData.snapshot();
                 if (state.projectId === projectId) {
-                    state.cache = fetched;
-                    state.aggregate = aggregateWorkingTimeData(fetched);
-                    state.dataLoaded = true;
-                    state.reportSessions = fetched.reportSessions;
-                    state.accessibleSubmissions = fetched.accessibleSubmissions;
-                    state.status = saved ? 'updated' : 'updated-uncached';
-                    state.lastError = '';
+                    state.cache = snap.cache;
+                    state.aggregate = snap.aggregate;
+                    state.dataLoaded = !!snap.cache;
+                    state.reportSessions = snap.reportSessions;
+                    state.accessibleSubmissions = snap.accessibleSubmissions;
+                    state.status = ok ? 'updated' : (state.dataLoaded ? 'cached-failed' : 'load-error');
+                    state.lastError = snap.lastError || '';
                 }
-                return true;
+                return ok;
             }
             catch (error) {
                 modules.logger.console.warn('[Working time] Refresh failed:', error);
@@ -8311,7 +9509,7 @@ factories.workingTime = function createWorkingTime(modules) {
                 const queuedProjectId = state.queuedProjectId;
                 state.queuedProjectId = '';
                 if (queuedProjectId && queuedProjectId === state.projectId && state.active
-                    && !isWorkingTimeCacheFresh(state.cache))
+                    && !modules.workData.isCacheFresh())
                     window.setTimeout(() => { void refreshWorkingTimeData(true); }, 0);
             }
         })();
@@ -8432,8 +9630,33 @@ factories.workingTime = function createWorkingTime(modules) {
         }
         else if (action === 'range') {
             const range = target.getAttribute('data-tbwt-range');
-            if (['7', '30', 'all'].includes(range))
+            if (['7', '30', 'all'].includes(range)) {
                 state.selectedRange = range;
+                state.selectedPreset = range === 'all' ? 'all' : range;
+            }
+            renderWorkingTimeDashboard();
+        }
+        else if (action === 'preset') {
+            const preset = target.getAttribute('data-tbwt-preset') || 'month';
+            state.selectedPreset = preset;
+            // Map preset onto selectedMonth / selectedRange used by existing render paths.
+            const resolved = modules.workData.resolveRangePreset(preset);
+            if (preset === 'today' || preset === '7') {
+                state.selectedMonth = modules.workData.localMonthKey();
+                state.selectedRange = preset === 'today' ? '7' : '7';
+            } else if (preset === 'month') {
+                state.selectedMonth = modules.workData.localMonthKey();
+                state.selectedRange = 'all';
+            } else if (preset === 'lastMonth') {
+                state.selectedMonth = resolved.from.slice(0, 7);
+                state.selectedRange = 'all';
+            } else {
+                state.selectedMonth = modules.workData.localMonthKey();
+                state.selectedRange = 'all';
+            }
+            state.presetFrom = resolved.from;
+            state.presetTo = resolved.to;
+            state.presetLabel = resolved.label;
             renderWorkingTimeDashboard();
         }
     }
@@ -8761,6 +9984,29 @@ factories.workingTime = function createWorkingTime(modules) {
         window.addEventListener('pageshow', scheduleNavigationRefresh);
         observeProjectNavigation();
         reconcileProjectNavigation();
+        // Keep dashboard + earnings header in sync when workData refreshes (e.g. after submit).
+        if (modules.workData && typeof modules.workData.subscribe === 'function') {
+            modules.workData.subscribe(snap => {
+                if (!snap) return;
+                if (state.active && state.projectId === snap.projectId) {
+                    state.cache = snap.cache;
+                    state.aggregate = snap.aggregate;
+                    state.dataLoaded = !!snap.cache;
+                    state.reportSessions = snap.reportSessions;
+                    state.accessibleSubmissions = snap.accessibleSubmissions;
+                    if (!state.isWorkingTimeLoading)
+                        state.status = snap.status === 'updated' ? 'updated' : state.status;
+                    renderWorkingTimeDashboard();
+                }
+                try {
+                    if (modules.earnings && typeof modules.earnings.updateMyEarnings === 'function') {
+                        // Light UI sync only — workData already holds the numbers.
+                        if (typeof modules.earnings.renderTotalEarnings === 'function')
+                            modules.earnings.renderTotalEarnings();
+                    }
+                } catch (_) {}
+            });
+        }
     }
 
     return {
@@ -9085,7 +10331,7 @@ factories.bootstrap = function createBootstrap(modules) {
         if (started) return;
         started = true;
         refresh('panel', modules.panel.ensurePanel, 1000);
-        refresh('report-hours', modules.earnings.ensureMyReportWorkingHoursCard, 1000);
+        // WORKING HOURS card in My report removed; unified data in workData + Working time tab.
         refresh('controls', modules.controls.injectUIControls, 500);
         refresh('monitor-status', modules.monitorStatusView.mount, 1000);
         modules.storage.loadCaches().catch(error => modules.logger.console.warn('[Cache]', error.message));
@@ -9126,6 +10372,7 @@ factories.bootstrap = function createBootstrap(modules) {
     modules.keepAwake = factories.keepAwake(modules);
     modules.controls = factories.controls(modules);
     modules.monitorStatusView = factories.monitorStatusView(modules);
+    modules.workData = factories.workData(modules);
     modules.earnings = factories.earnings(modules);
     modules.workingTime = factories.workingTime(modules);
     modules.passExamples = factories.passExamples(modules);
@@ -9136,6 +10383,7 @@ factories.bootstrap = function createBootstrap(modules) {
     modules.gemini.init();
     modules.media.init();
     modules.auth.init();
+    modules.workData.init();
     modules.workingTime.init();
     modules.controls.init();
     modules.passExamples.init();
